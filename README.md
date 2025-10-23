@@ -26,12 +26,31 @@ make
 
 The build produces the `z80` executable in the project root.
 
+### Building the sample CP/M program
+
+To quickly verify the emulator, the repository ships with a minimal CP/M-compatible program in `examples/hello.asm`. A matching
+hex listing is converted into a runnable binary using Python. Generate it with:
+
+```
+make example
+```
+
+This creates `examples/hello.bin`, which loads at the CP/M transient program area.
+
 ## Running
 The emulator currently accepts a raw binary to load at the standard CP/M transient program area (`0x0100`). It executes instructions until a `HALT` is encountered or a cycle budget is exhausted.
 
 ```
 ./z80 path/to/program.bin
 ```
+
+For the bundled sample program:
+
+```
+./z80 examples/hello.bin
+```
+
+The BDOS shim prints the greeting stored in the sample program and then returns to the host.
 
 Useful command-line options:
 
