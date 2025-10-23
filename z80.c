@@ -665,6 +665,25 @@ static bool handle_cpm_entry(Emulator *emu, int *cycles)
 
 static void handle_out(uint8_t port, uint8_t value);
 static uint8_t handle_in(uint8_t port);
+static uint8_t fetch8(Emulator *emu);
+static uint16_t fetch16(Emulator *emu);
+static int execute_ld_r_n(Emulator *emu, uint8_t opcode);
+static int execute_ld_r_r(Emulator *emu, uint8_t opcode);
+static int execute_inc_r(Emulator *emu, uint8_t opcode);
+static int execute_dec_r(Emulator *emu, uint8_t opcode);
+static void set_flags_inc(Z80 *cpu, uint8_t before, uint8_t result);
+static void set_flags_dec(Z80 *cpu, uint8_t before, uint8_t result);
+static void z80_add_a(Z80 *cpu, uint8_t value, uint8_t carry);
+static void z80_sub_a(Z80 *cpu, uint8_t value, uint8_t carry, bool store);
+static void z80_and_a(Z80 *cpu, uint8_t value);
+static void z80_xor_a(Z80 *cpu, uint8_t value);
+static void z80_or_a(Z80 *cpu, uint8_t value);
+static int execute_add_a_r(Emulator *emu, uint8_t opcode, uint8_t carry);
+static int execute_sub_a_r(Emulator *emu, uint8_t opcode, uint8_t carry, bool store);
+static int execute_logic_a_r(Emulator *emu, uint8_t opcode, void (*op)(Z80 *, uint8_t));
+static int execute_primary_opcode(Emulator *emu, uint8_t opcode, uint16_t pc);
+static int execute_indexed_prefixed(Emulator *emu, bool use_ix);
+static int execute_index_cb_prefixed(Emulator *emu, bool use_ix);
 
 static inline void set_flag(Z80 *cpu, uint8_t mask, bool value)
 {
@@ -748,6 +767,339 @@ static void write_operand(Emulator *emu, uint8_t index, uint8_t value)
     if (reg != NULL) {
         *reg = value;
     }
+}
+
+static inline uint8_t z80_ixh(const Z80 *cpu)
+{
+    return (uint8_t)((cpu->ix >> 8) & 0xFFU);
+}
+
+static inline uint8_t z80_ixl(const Z80 *cpu)
+{
+    return (uint8_t)(cpu->ix & 0xFFU);
+}
+
+static inline void z80_set_ixh(Z80 *cpu, uint8_t value)
+{
+    cpu->ix = (uint16_t)((cpu->ix & 0x00FFU) | ((uint16_t)value << 8));
+}
+
+static inline void z80_set_ixl(Z80 *cpu, uint8_t value)
+{
+    cpu->ix = (uint16_t)((cpu->ix & 0xFF00U) | value);
+}
+
+static inline uint8_t z80_iyh(const Z80 *cpu)
+{
+    return (uint8_t)((cpu->iy >> 8) & 0xFFU);
+}
+
+static inline uint8_t z80_iyl(const Z80 *cpu)
+{
+    return (uint8_t)(cpu->iy & 0xFFU);
+}
+
+static inline void z80_set_iyh(Z80 *cpu, uint8_t value)
+{
+    cpu->iy = (uint16_t)((cpu->iy & 0x00FFU) | ((uint16_t)value << 8));
+}
+
+static inline void z80_set_iyl(Z80 *cpu, uint8_t value)
+{
+    cpu->iy = (uint16_t)((cpu->iy & 0xFF00U) | value);
+}
+
+static inline uint16_t z80_get_index(const Z80 *cpu, bool use_ix)
+{
+    return use_ix ? cpu->ix : cpu->iy;
+}
+
+static inline void z80_set_index(Z80 *cpu, bool use_ix, uint16_t value)
+{
+    if (use_ix) {
+        cpu->ix = value;
+    } else {
+        cpu->iy = value;
+    }
+}
+
+static inline uint8_t z80_index_high(const Z80 *cpu, bool use_ix)
+{
+    return use_ix ? z80_ixh(cpu) : z80_iyh(cpu);
+}
+
+static inline uint8_t z80_index_low(const Z80 *cpu, bool use_ix)
+{
+    return use_ix ? z80_ixl(cpu) : z80_iyl(cpu);
+}
+
+static inline void z80_set_index_high(Z80 *cpu, bool use_ix, uint8_t value)
+{
+    if (use_ix) {
+        z80_set_ixh(cpu, value);
+    } else {
+        z80_set_iyh(cpu, value);
+    }
+}
+
+static inline void z80_set_index_low(Z80 *cpu, bool use_ix, uint8_t value)
+{
+    if (use_ix) {
+        z80_set_ixl(cpu, value);
+    } else {
+        z80_set_iyl(cpu, value);
+    }
+}
+
+static inline uint16_t z80_index_address(const Z80 *cpu, bool use_ix, int8_t displacement)
+{
+    uint16_t base = z80_get_index(cpu, use_ix);
+    return (uint16_t)(base + (int16_t)displacement);
+}
+
+static uint8_t read_index_register(const Z80 *cpu, bool use_ix, uint8_t index)
+{
+    switch (index & 0x07U) {
+    case 0:
+        return cpu->b;
+    case 1:
+        return cpu->c;
+    case 2:
+        return cpu->d;
+    case 3:
+        return cpu->e;
+    case 4:
+        return z80_index_high(cpu, use_ix);
+    case 5:
+        return z80_index_low(cpu, use_ix);
+    case 7:
+        return cpu->a;
+    default:
+        return 0U;
+    }
+}
+
+static void write_index_register(Z80 *cpu, bool use_ix, uint8_t index, uint8_t value)
+{
+    switch (index & 0x07U) {
+    case 0:
+        cpu->b = value;
+        break;
+    case 1:
+        cpu->c = value;
+        break;
+    case 2:
+        cpu->d = value;
+        break;
+    case 3:
+        cpu->e = value;
+        break;
+    case 4:
+        z80_set_index_high(cpu, use_ix, value);
+        break;
+    case 5:
+        z80_set_index_low(cpu, use_ix, value);
+        break;
+    case 7:
+        cpu->a = value;
+        break;
+    default:
+        break;
+    }
+}
+
+static int execute_indexed_inc_r(Emulator *emu, uint8_t opcode, bool use_ix)
+{
+    uint8_t index = (opcode >> 3) & 0x07U;
+    if (index == 4U) {
+        uint8_t before = z80_index_high(&emu->cpu, use_ix);
+        uint8_t result = (uint8_t)(before + 1U);
+        z80_set_index_high(&emu->cpu, use_ix, result);
+        set_flags_inc(&emu->cpu, before, result);
+        return 8;
+    }
+    if (index == 5U) {
+        uint8_t before = z80_index_low(&emu->cpu, use_ix);
+        uint8_t result = (uint8_t)(before + 1U);
+        z80_set_index_low(&emu->cpu, use_ix, result);
+        set_flags_inc(&emu->cpu, before, result);
+        return 8;
+    }
+    if (index == 6U) {
+        int8_t disp = (int8_t)fetch8(emu);
+        uint16_t addr = z80_index_address(&emu->cpu, use_ix, disp);
+        uint8_t before = memory_read8(emu, addr);
+        uint8_t result = (uint8_t)(before + 1U);
+        memory_write8(emu, addr, result);
+        set_flags_inc(&emu->cpu, before, result);
+        return 23;
+    }
+    int cycles = execute_inc_r(emu, opcode);
+    return cycles + 4;
+}
+
+static int execute_indexed_dec_r(Emulator *emu, uint8_t opcode, bool use_ix)
+{
+    uint8_t index = (opcode >> 3) & 0x07U;
+    if (index == 4U) {
+        uint8_t before = z80_index_high(&emu->cpu, use_ix);
+        uint8_t result = (uint8_t)(before - 1U);
+        z80_set_index_high(&emu->cpu, use_ix, result);
+        set_flags_dec(&emu->cpu, before, result);
+        return 8;
+    }
+    if (index == 5U) {
+        uint8_t before = z80_index_low(&emu->cpu, use_ix);
+        uint8_t result = (uint8_t)(before - 1U);
+        z80_set_index_low(&emu->cpu, use_ix, result);
+        set_flags_dec(&emu->cpu, before, result);
+        return 8;
+    }
+    if (index == 6U) {
+        int8_t disp = (int8_t)fetch8(emu);
+        uint16_t addr = z80_index_address(&emu->cpu, use_ix, disp);
+        uint8_t before = memory_read8(emu, addr);
+        uint8_t result = (uint8_t)(before - 1U);
+        memory_write8(emu, addr, result);
+        set_flags_dec(&emu->cpu, before, result);
+        return 23;
+    }
+    int cycles = execute_dec_r(emu, opcode);
+    return cycles + 4;
+}
+
+static int execute_indexed_ld_r_n(Emulator *emu, uint8_t opcode, bool use_ix)
+{
+    uint8_t index = (opcode >> 3) & 0x07U;
+    if (index == 4U) {
+        uint8_t value = fetch8(emu);
+        z80_set_index_high(&emu->cpu, use_ix, value);
+        return 11;
+    }
+    if (index == 5U) {
+        uint8_t value = fetch8(emu);
+        z80_set_index_low(&emu->cpu, use_ix, value);
+        return 11;
+    }
+    if (index == 6U) {
+        int8_t disp = (int8_t)fetch8(emu);
+        uint8_t value = fetch8(emu);
+        uint16_t addr = z80_index_address(&emu->cpu, use_ix, disp);
+        memory_write8(emu, addr, value);
+        return 19;
+    }
+    int cycles = execute_ld_r_n(emu, opcode);
+    return cycles + 4;
+}
+
+static int execute_indexed_ld_r_r(Emulator *emu, uint8_t opcode, bool use_ix)
+{
+    if (opcode == 0x76U) {
+        emu->cpu.halted = true;
+        return 4;
+    }
+
+    uint8_t dest = (opcode >> 3) & 0x07U;
+    uint8_t src = opcode & 0x07U;
+    bool disp_loaded = false;
+    int8_t disp = 0;
+    uint8_t value = 0U;
+    int cycles = 8;
+
+    if (src == 6U) {
+        disp = (int8_t)fetch8(emu);
+        disp_loaded = true;
+        uint16_t addr = z80_index_address(&emu->cpu, use_ix, disp);
+        value = memory_read8(emu, addr);
+        cycles = 19;
+    } else {
+        value = read_index_register(&emu->cpu, use_ix, src);
+    }
+
+    if (dest == 6U) {
+        if (!disp_loaded) {
+            disp = (int8_t)fetch8(emu);
+            disp_loaded = true;
+        }
+        uint16_t addr = z80_index_address(&emu->cpu, use_ix, disp);
+        memory_write8(emu, addr, value);
+        cycles = 19;
+    } else {
+        write_index_register(&emu->cpu, use_ix, dest, value);
+        if (src != 6U && dest != 6U) {
+            if ((dest == 4U || dest == 5U) || (src == 4U || src == 5U)) {
+                cycles = 8;
+            } else {
+                int base = execute_ld_r_r(emu, opcode);
+                return base + 4;
+            }
+        }
+    }
+
+    return cycles;
+}
+
+static int execute_indexed_add_a_r(Emulator *emu, uint8_t opcode, uint8_t carry, bool use_ix)
+{
+    uint8_t src = opcode & 0x07U;
+    if (src == 4U) {
+        z80_add_a(&emu->cpu, z80_index_high(&emu->cpu, use_ix), carry);
+        return 8;
+    }
+    if (src == 5U) {
+        z80_add_a(&emu->cpu, z80_index_low(&emu->cpu, use_ix), carry);
+        return 8;
+    }
+    if (src == 6U) {
+        int8_t disp = (int8_t)fetch8(emu);
+        uint8_t value = memory_read8(emu, z80_index_address(&emu->cpu, use_ix, disp));
+        z80_add_a(&emu->cpu, value, carry);
+        return 19;
+    }
+    int cycles = execute_add_a_r(emu, opcode, carry);
+    return cycles + 4;
+}
+
+static int execute_indexed_sub_a_r(Emulator *emu, uint8_t opcode, uint8_t carry, bool store, bool use_ix)
+{
+    uint8_t src = opcode & 0x07U;
+    if (src == 4U) {
+        z80_sub_a(&emu->cpu, z80_index_high(&emu->cpu, use_ix), carry, store);
+        return 8;
+    }
+    if (src == 5U) {
+        z80_sub_a(&emu->cpu, z80_index_low(&emu->cpu, use_ix), carry, store);
+        return 8;
+    }
+    if (src == 6U) {
+        int8_t disp = (int8_t)fetch8(emu);
+        uint8_t value = memory_read8(emu, z80_index_address(&emu->cpu, use_ix, disp));
+        z80_sub_a(&emu->cpu, value, carry, store);
+        return 19;
+    }
+    int cycles = execute_sub_a_r(emu, opcode, carry, store);
+    return cycles + 4;
+}
+
+static int execute_indexed_logic_a_r(Emulator *emu, uint8_t opcode, void (*op)(Z80 *, uint8_t), bool use_ix)
+{
+    uint8_t src = opcode & 0x07U;
+    if (src == 4U) {
+        op(&emu->cpu, z80_index_high(&emu->cpu, use_ix));
+        return 8;
+    }
+    if (src == 5U) {
+        op(&emu->cpu, z80_index_low(&emu->cpu, use_ix));
+        return 8;
+    }
+    if (src == 6U) {
+        int8_t disp = (int8_t)fetch8(emu);
+        uint8_t value = memory_read8(emu, z80_index_address(&emu->cpu, use_ix, disp));
+        op(&emu->cpu, value);
+        return 19;
+    }
+    int cycles = execute_logic_a_r(emu, opcode, op);
+    return cycles + 4;
 }
 
 static void set_flags_inc(Z80 *cpu, uint8_t before, uint8_t result)
@@ -1184,6 +1536,331 @@ static int execute_cb_prefixed(Emulator *emu)
     }
 }
 
+static int execute_indexed_prefixed(Emulator *emu, bool use_ix)
+{
+    uint8_t opcode = fetch8(emu);
+    uint16_t pc = (uint16_t)(emu->cpu.pc - 1U);
+
+    switch (opcode) {
+    case 0x09:
+    case 0x19:
+    case 0x29:
+    case 0x39: {
+        uint8_t pair = (opcode >> 4) & 0x03U;
+        uint32_t lhs = z80_get_index(&emu->cpu, use_ix);
+        uint32_t rhs;
+        switch (pair) {
+        case 0:
+            rhs = z80_bc(&emu->cpu);
+            break;
+        case 1:
+            rhs = z80_de(&emu->cpu);
+            break;
+        case 2:
+            rhs = z80_get_index(&emu->cpu, use_ix);
+            break;
+        default:
+            rhs = emu->cpu.sp;
+            break;
+        }
+        uint32_t result = lhs + rhs;
+        set_flag(&emu->cpu, FLAG_N, false);
+        set_flag(&emu->cpu, FLAG_H, ((lhs & 0x0FFFU) + (rhs & 0x0FFFU)) > 0x0FFFU);
+        set_flag(&emu->cpu, FLAG_C, result > 0xFFFFU);
+        z80_set_index(&emu->cpu, use_ix, (uint16_t)result);
+        return 15;
+    }
+    case 0x21: {
+        uint16_t value = fetch16(emu);
+        z80_set_index(&emu->cpu, use_ix, value);
+        return 14;
+    }
+    case 0x22: {
+        uint16_t addr = fetch16(emu);
+        memory_write16(emu, addr, z80_get_index(&emu->cpu, use_ix));
+        return 20;
+    }
+    case 0x23:
+        z80_set_index(&emu->cpu, use_ix, (uint16_t)(z80_get_index(&emu->cpu, use_ix) + 1U));
+        return 10;
+    case 0x24:
+    case 0x2C:
+    case 0x34:
+        return execute_indexed_inc_r(emu, opcode, use_ix);
+    case 0x25:
+    case 0x2D:
+    case 0x35:
+        return execute_indexed_dec_r(emu, opcode, use_ix);
+    case 0x26:
+    case 0x2E:
+    case 0x36:
+        return execute_indexed_ld_r_n(emu, opcode, use_ix);
+    case 0x2A: {
+        uint16_t addr = fetch16(emu);
+        uint16_t value = memory_read16(emu, addr);
+        z80_set_index(&emu->cpu, use_ix, value);
+        return 20;
+    }
+    case 0x2B:
+        z80_set_index(&emu->cpu, use_ix, (uint16_t)(z80_get_index(&emu->cpu, use_ix) - 1U));
+        return 10;
+    case 0x44:
+    case 0x45:
+    case 0x46:
+    case 0x47:
+    case 0x4C:
+    case 0x4D:
+    case 0x4E:
+    case 0x4F:
+    case 0x54:
+    case 0x55:
+    case 0x56:
+    case 0x57:
+    case 0x5C:
+    case 0x5D:
+    case 0x5E:
+    case 0x5F:
+    case 0x60:
+    case 0x61:
+    case 0x62:
+    case 0x63:
+    case 0x64:
+    case 0x65:
+    case 0x66:
+    case 0x67:
+    case 0x68:
+    case 0x69:
+    case 0x6A:
+    case 0x6B:
+    case 0x6C:
+    case 0x6D:
+    case 0x6E:
+    case 0x6F:
+    case 0x70:
+    case 0x71:
+    case 0x72:
+    case 0x73:
+    case 0x74:
+    case 0x75:
+    case 0x77:
+    case 0x78:
+    case 0x79:
+    case 0x7A:
+    case 0x7B:
+    case 0x7C:
+    case 0x7D:
+    case 0x7E:
+    case 0x7F:
+        return execute_indexed_ld_r_r(emu, opcode, use_ix);
+    case 0x80:
+    case 0x81:
+    case 0x82:
+    case 0x83:
+    case 0x84:
+    case 0x85:
+    case 0x86:
+    case 0x87:
+        return execute_indexed_add_a_r(emu, opcode, 0U, use_ix);
+    case 0x88:
+    case 0x89:
+    case 0x8A:
+    case 0x8B:
+    case 0x8C:
+    case 0x8D:
+    case 0x8E:
+    case 0x8F:
+        return execute_indexed_add_a_r(emu, opcode, flag_set(&emu->cpu, FLAG_C) ? 1U : 0U, use_ix);
+    case 0x90:
+    case 0x91:
+    case 0x92:
+    case 0x93:
+    case 0x94:
+    case 0x95:
+    case 0x96:
+    case 0x97:
+        return execute_indexed_sub_a_r(emu, opcode, 0U, true, use_ix);
+    case 0x98:
+    case 0x99:
+    case 0x9A:
+    case 0x9B:
+    case 0x9C:
+    case 0x9D:
+    case 0x9E:
+    case 0x9F:
+        return execute_indexed_sub_a_r(emu, opcode, flag_set(&emu->cpu, FLAG_C) ? 1U : 0U, true, use_ix);
+    case 0xA0:
+    case 0xA1:
+    case 0xA2:
+    case 0xA3:
+    case 0xA4:
+    case 0xA5:
+    case 0xA6:
+    case 0xA7:
+        return execute_indexed_logic_a_r(emu, opcode, z80_and_a, use_ix);
+    case 0xA8:
+    case 0xA9:
+    case 0xAA:
+    case 0xAB:
+    case 0xAC:
+    case 0xAD:
+    case 0xAE:
+    case 0xAF:
+        return execute_indexed_logic_a_r(emu, opcode, z80_xor_a, use_ix);
+    case 0xB0:
+    case 0xB1:
+    case 0xB2:
+    case 0xB3:
+    case 0xB4:
+    case 0xB5:
+    case 0xB6:
+    case 0xB7:
+        return execute_indexed_logic_a_r(emu, opcode, z80_or_a, use_ix);
+    case 0xB8:
+    case 0xB9:
+    case 0xBA:
+    case 0xBB:
+    case 0xBC:
+    case 0xBD:
+    case 0xBE:
+    case 0xBF:
+        return execute_indexed_sub_a_r(emu, opcode, 0U, false, use_ix);
+    case 0xCB:
+        return execute_index_cb_prefixed(emu, use_ix);
+    case 0xDD:
+        return execute_indexed_prefixed(emu, use_ix);
+    case 0xE1: {
+        uint16_t value = z80_pop(emu);
+        z80_set_index(&emu->cpu, use_ix, value);
+        return 14;
+    }
+    case 0xE3: {
+        uint16_t value = memory_read16(emu, emu->cpu.sp);
+        uint16_t index = z80_get_index(&emu->cpu, use_ix);
+        memory_write16(emu, emu->cpu.sp, index);
+        z80_set_index(&emu->cpu, use_ix, value);
+        return 23;
+    }
+    case 0xE5:
+        z80_push(emu, z80_get_index(&emu->cpu, use_ix));
+        return 15;
+    case 0xE9:
+        emu->cpu.pc = z80_get_index(&emu->cpu, use_ix);
+        return 8;
+    case 0xF9:
+        emu->cpu.sp = z80_get_index(&emu->cpu, use_ix);
+        return 10;
+    case 0xFD:
+        return execute_indexed_prefixed(emu, false);
+    default:
+        break;
+    }
+
+    int cycles = execute_primary_opcode(emu, opcode, pc);
+    return cycles + 4;
+}
+
+static int execute_index_cb_prefixed(Emulator *emu, bool use_ix)
+{
+    int8_t displacement = (int8_t)fetch8(emu);
+    uint8_t opcode = fetch8(emu);
+    uint16_t addr = z80_index_address(&emu->cpu, use_ix, displacement);
+    uint8_t value = memory_read8(emu, addr);
+    uint8_t reg_index = opcode & 0x07U;
+    uint8_t group = opcode >> 6;
+
+    switch (group) {
+    case 0: { /* Rotate/shift */
+        uint8_t result;
+        switch ((opcode >> 3) & 0x07U) {
+        case 0:
+            result = z80_rlc_value(&emu->cpu, value);
+            break;
+        case 1:
+            result = z80_rrc_value(&emu->cpu, value);
+            break;
+        case 2:
+            result = z80_rl_value(&emu->cpu, value);
+            break;
+        case 3:
+            result = z80_rr_value(&emu->cpu, value);
+            break;
+        case 4:
+            result = z80_sla_value(&emu->cpu, value);
+            break;
+        case 5:
+            result = z80_sra_value(&emu->cpu, value);
+            break;
+        case 6:
+            result = z80_sll_value(&emu->cpu, value);
+            break;
+        default:
+            result = z80_srl_value(&emu->cpu, value);
+            break;
+        }
+
+        memory_write8(emu, addr, result);
+
+        if (reg_index == 4U) {
+            z80_set_index_high(&emu->cpu, use_ix, result);
+        } else if (reg_index == 5U) {
+            z80_set_index_low(&emu->cpu, use_ix, result);
+        } else if (reg_index != 6U) {
+            uint8_t *reg = decode_register(&emu->cpu, reg_index);
+            if (reg != NULL) {
+                *reg = result;
+            }
+        }
+
+        return (reg_index == 6U) ? 23 : 20;
+    }
+    case 1: { /* BIT */
+        uint8_t bit = (opcode >> 3) & 0x07U;
+        bool bit_set = (value & (uint8_t)(1U << bit)) != 0U;
+        bool carry = flag_set(&emu->cpu, FLAG_C);
+
+        set_flag(&emu->cpu, FLAG_H, true);
+        set_flag(&emu->cpu, FLAG_N, false);
+        set_flag(&emu->cpu, FLAG_Z, !bit_set);
+        set_flag(&emu->cpu, FLAG_PV, !bit_set);
+        if (bit == 7U) {
+            set_flag(&emu->cpu, FLAG_S, bit_set);
+        }
+        set_flag(&emu->cpu, FLAG_C, carry);
+
+        return 20;
+    }
+    case 2:
+    case 3: { /* RES/SET */
+        uint8_t bit = (opcode >> 3) & 0x07U;
+        uint8_t mask = (uint8_t)(1U << bit);
+        uint8_t result = (group == 2U) ? (uint8_t)(value & (uint8_t)~mask)
+                                      : (uint8_t)(value | mask);
+
+        memory_write8(emu, addr, result);
+
+        if (reg_index == 4U) {
+            z80_set_index_high(&emu->cpu, use_ix, result);
+        } else if (reg_index == 5U) {
+            z80_set_index_low(&emu->cpu, use_ix, result);
+        } else if (reg_index == 6U) {
+            /* Memory already updated. */
+        } else {
+            uint8_t *reg = decode_register(&emu->cpu, reg_index);
+            if (reg != NULL) {
+                *reg = result;
+            }
+        }
+
+        return (reg_index == 6U) ? 23 : 20;
+    }
+    default:
+        break;
+    }
+
+    fprintf(stderr, "Unhandled index CB opcode 0x%02X at PC=0x%04X\n", opcode, (uint16_t)(emu->cpu.pc - 2U));
+    exit(EXIT_FAILURE);
+}
+
 static void set_flags_add16(Z80 *cpu, uint32_t lhs, uint32_t rhs, uint32_t result, uint8_t carry_in)
 {
     uint16_t value16 = (uint16_t)result;
@@ -1553,20 +2230,8 @@ static uint8_t handle_in(uint8_t port)
 }
 
 
-static int z80_step(Emulator *emu)
+static int execute_primary_opcode(Emulator *emu, uint8_t opcode, uint16_t pc)
 {
-    if (emu->cpu.halted) {
-        return 4;
-    }
-
-    int trap_cycles = 0;
-    if (handle_cpm_entry(emu, &trap_cycles)) {
-        return trap_cycles;
-    }
-
-    uint16_t pc = emu->cpu.pc;
-    uint8_t opcode = fetch8(emu);
-
     switch (opcode) {
     case 0x00:
         return 4;
@@ -2053,8 +2718,7 @@ static int z80_step(Emulator *emu)
         return 11;
     }
     case 0xDD:
-        fprintf(stderr, "DD-prefixed opcode not implemented at PC=0x%04X\n", pc);
-        exit(EXIT_FAILURE);
+        return execute_indexed_prefixed(emu, true);
     case 0xDE: {
         uint8_t value = fetch8(emu);
         z80_sub_a(&emu->cpu, value, flag_set(&emu->cpu, FLAG_C) ? 1U : 0U, true);
@@ -2108,8 +2772,7 @@ static int z80_step(Emulator *emu)
         emu->cpu.iff2 = true;
         return 4;
     case 0xFD:
-        fprintf(stderr, "FD-prefixed opcode not implemented at PC=0x%04X\n", pc);
-        exit(EXIT_FAILURE);
+        return execute_indexed_prefixed(emu, false);
     case 0xFE: {
         uint8_t value = fetch8(emu);
         z80_sub_a(&emu->cpu, value, 0U, false);
@@ -2123,6 +2786,24 @@ static int z80_step(Emulator *emu)
     fprintf(stderr, "Opcode 0x%02X fell through at PC=0x%04X\n", opcode, pc);
     exit(EXIT_FAILURE);
 }
+
+static int z80_step(Emulator *emu)
+{
+    if (emu->cpu.halted) {
+        return 4;
+    }
+
+    int trap_cycles = 0;
+    if (handle_cpm_entry(emu, &trap_cycles)) {
+        return trap_cycles;
+    }
+
+    uint16_t pc = emu->cpu.pc;
+    uint8_t opcode = fetch8(emu);
+
+    return execute_primary_opcode(emu, opcode, pc);
+}
+
 static void emulator_init(Emulator *emu)
 {
     memset(emu, 0, sizeof(*emu));
