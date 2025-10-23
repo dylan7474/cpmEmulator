@@ -35,7 +35,7 @@ hex listing is converted into a runnable binary using Python. Generate it with:
 make example
 ```
 
-This creates `examples/hello.bin`, which loads at the CP/M transient program area.
+This creates `examples/hello.bin`, which loads at the CP/M transient program area and is used by the smoke tests below.
 
 ## Running
 The emulator currently accepts a raw binary to load at the standard CP/M transient program area (`0x0100`). It executes instructions until a `HALT` is encountered or a cycle budget is exhausted.
@@ -52,6 +52,18 @@ For the bundled sample program:
 
 The BDOS shim prints the greeting stored in the sample program and then returns to the host.
 
+## Testing
+
+Until an automated harness is introduced, exercise the emulator manually with the bundled CP/M binary after every change:
+
+```
+make example
+./z80 examples/hello.bin
+```
+
+Successful runs show the `Hello from CP/M!` greeting, demonstrating that the command console trampolines are still wired
+correctly and that the recently implemented Z80 `ED` and index-prefixed helpers behave as expected in a real program.
+
 Useful command-line options:
 
 - `--cycles N` – Limit execution to `N` T-states before halting automatically (default: 1,000,000).
@@ -60,8 +72,8 @@ Useful command-line options:
 Because many index (`DD`/`FD`) prefixed opcodes and most peripheral behaviours are still incomplete, running an arbitrary CP/M program can still terminate with an "Unimplemented opcode" message. This is intentional at this stage so missing instructions can be filled in incrementally.
 
 ## Next steps
-- Broaden the instruction decoder until CP/M system programs (such as the CCP and BDOS) execute correctly.
-- Flesh out disk access helpers with sector caching, directory parsing, and optional disk geometry configuration.
-- Audit the newly implemented ED-prefixed opcodes against CP/M binaries and add tests to ensure their flag and timing behaviour remain correct.
+- Finish implementing the IX/IY-prefixed arithmetic, load, and block instructions so CP/M system programs (such as the CCP and BDOS) execute without hitting the "Unimplemented opcode" trap.
+- Flesh out disk access helpers with sector caching, directory parsing, and optional disk geometry configuration, then wire them into the BDOS trampolines used by the console example.
+- Replace the manual smoke test with an automated integration test that assembles the example program, runs it under the emulator, and asserts on the captured console output to prevent regressions in flag handling for recently added ED-prefixed opcodes.
 
 Contributions that expand opcode coverage, improve testing, or add CP/M-compatible peripherals are welcome.
