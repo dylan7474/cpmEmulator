@@ -5,7 +5,7 @@ This repository now focuses on a compact Z80 CPU core intended for experimenting
 
 The current state includes:
 
-- A CPU core that implements the full 8080 instruction set along with the Z80 rotate/bit (`CB`) and block transfer/compare (`ED`) groups required by CP/M system binaries.
+- A CPU core that implements the full 8080 instruction set along with the Z80 rotate/bit (`CB`) and block transfer/compare (`ED`) groups required by CP/M system binaries, including recent additions such as `NEG`, `RETN`/`RETI`, interrupt mode selection (`IM n`), register transfers with `I`/`R`, and the decimal rotate helpers `RRD`/`RLD`.
 - A flat 64 KiB memory map suitable for early CP/M programs.
 - A stubbed disk drive abstraction that can read or write raw sector data from a disk image, paving the way for future BDOS and BIOS emulation.
 - CP/M-style BIOS warm boot and BDOS entry points that translate console and file calls into host operations so simple programs can interact with the environment.
@@ -43,5 +43,6 @@ Because index (`DD`/`FD`) prefixes and most peripheral behaviours are still stub
 ## Next steps
 - Broaden the instruction decoder until CP/M system programs (such as the CCP and BDOS) execute correctly.
 - Flesh out disk access helpers with sector caching, directory parsing, and optional disk geometry configuration.
+- Audit the newly implemented ED-prefixed opcodes against CP/M binaries and add tests to ensure their flag and timing behaviour remain correct.
 
 Contributions that expand opcode coverage, improve testing, or add CP/M-compatible peripherals are welcome.
