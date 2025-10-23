@@ -857,6 +857,58 @@ static inline uint16_t z80_index_address(const Z80 *cpu, bool use_ix, int8_t dis
     return (uint16_t)(base + (int16_t)displacement);
 }
 
+typedef enum {
+    INDEX_MODE_HL,
+    INDEX_MODE_IX,
+    INDEX_MODE_IY
+} IndexMode;
+
+static inline uint16_t z80_get_hl_variant(const Z80 *cpu, IndexMode mode)
+{
+    switch (mode) {
+    case INDEX_MODE_IX:
+        return cpu->ix;
+    case INDEX_MODE_IY:
+        return cpu->iy;
+    default:
+        return z80_hl(cpu);
+    }
+}
+
+static inline void z80_set_hl_variant(Z80 *cpu, IndexMode mode, uint16_t value)
+{
+    switch (mode) {
+    case INDEX_MODE_IX:
+        cpu->ix = value;
+        break;
+    case INDEX_MODE_IY:
+        cpu->iy = value;
+        break;
+    default:
+        z80_set_hl(cpu, value);
+        break;
+    }
+}
+
+static inline uint16_t z80_ed_get_pair(const Z80 *cpu, uint8_t pair, IndexMode mode)
+{
+    if (pair == 2U) {
+        return z80_get_hl_variant(cpu, mode);
+    }
+    return z80_get_pair(cpu, pair);
+}
+
+static inline void z80_ed_set_pair(Z80 *cpu, uint8_t pair, IndexMode mode, uint16_t value)
+{
+    if (pair == 2U) {
+        z80_set_hl_variant(cpu, mode, value);
+        return;
+    }
+    z80_set_pair(cpu, pair, value);
+}
+
+static int execute_ed_prefixed(Emulator *emu, IndexMode mode);
+
 static uint8_t read_index_register(const Z80 *cpu, bool use_ix, uint8_t index)
 {
     switch (index & 0x07U) {
@@ -1746,6 +1798,18 @@ static int execute_indexed_prefixed(Emulator *emu, bool use_ix)
     case 0xE9:
         emu->cpu.pc = z80_get_index(&emu->cpu, use_ix);
         return 8;
+    case 0xEB: {
+        uint16_t de = z80_de(&emu->cpu);
+        uint16_t index = z80_get_index(&emu->cpu, use_ix);
+        z80_set_de(&emu->cpu, index);
+        z80_set_index(&emu->cpu, use_ix, de);
+        return 8;
+    }
+    case 0xED: {
+        IndexMode mode = use_ix ? INDEX_MODE_IX : INDEX_MODE_IY;
+        int cycles = execute_ed_prefixed(emu, mode);
+        return cycles + 4;
+    }
     case 0xF9:
         emu->cpu.sp = z80_get_index(&emu->cpu, use_ix);
         return 10;
@@ -1886,7 +1950,7 @@ static void set_flags_sub16(Z80 *cpu, uint32_t lhs, uint32_t rhs, uint32_t resul
     set_flag(cpu, FLAG_PV, (((lhs ^ rhs) & (lhs ^ truncated)) & 0x8000U) != 0U);
 }
 
-static int execute_ed_prefixed(Emulator *emu)
+static int execute_ed_prefixed(Emulator *emu, IndexMode mode)
 {
     uint8_t opcode = fetch8(emu);
     switch (opcode) {
@@ -1983,11 +2047,11 @@ static int execute_ed_prefixed(Emulator *emu)
     }
     case 0x67: {
         bool carry = flag_set(&emu->cpu, FLAG_C);
-        uint16_t hl = z80_hl(&emu->cpu);
-        uint8_t value = memory_read8(emu, hl);
+        uint16_t addr = z80_get_hl_variant(&emu->cpu, mode);
+        uint8_t value = memory_read8(emu, addr);
         uint8_t new_mem = (uint8_t)(((emu->cpu.a & 0x0FU) << 4) | ((value >> 4) & 0x0FU));
         uint8_t new_a = (uint8_t)((emu->cpu.a & 0xF0U) | (value & 0x0FU));
-        memory_write8(emu, hl, new_mem);
+        memory_write8(emu, addr, new_mem);
         emu->cpu.a = new_a;
         set_flag(&emu->cpu, FLAG_S, (new_a & 0x80U) != 0U);
         set_flag(&emu->cpu, FLAG_Z, new_a == 0U);
@@ -1999,11 +2063,11 @@ static int execute_ed_prefixed(Emulator *emu)
     }
     case 0x6F: {
         bool carry = flag_set(&emu->cpu, FLAG_C);
-        uint16_t hl = z80_hl(&emu->cpu);
-        uint8_t value = memory_read8(emu, hl);
+        uint16_t addr = z80_get_hl_variant(&emu->cpu, mode);
+        uint8_t value = memory_read8(emu, addr);
         uint8_t new_mem = (uint8_t)(((value << 4) & 0xF0U) | (emu->cpu.a & 0x0FU));
         uint8_t new_a = (uint8_t)((emu->cpu.a & 0xF0U) | ((value >> 4) & 0x0FU));
-        memory_write8(emu, hl, new_mem);
+        memory_write8(emu, addr, new_mem);
         emu->cpu.a = new_a;
         set_flag(&emu->cpu, FLAG_S, (new_a & 0x80U) != 0U);
         set_flag(&emu->cpu, FLAG_Z, new_a == 0U);
@@ -2030,12 +2094,12 @@ static int execute_ed_prefixed(Emulator *emu)
     case 0x62:
     case 0x72: {
         uint8_t pair = (opcode >> 4) & 0x03U;
-        uint32_t hl = z80_hl(&emu->cpu);
-        uint32_t value = z80_get_pair(&emu->cpu, pair);
+        uint32_t lhs = z80_get_hl_variant(&emu->cpu, mode);
+        uint32_t rhs = z80_ed_get_pair(&emu->cpu, pair, mode);
         uint8_t borrow = flag_set(&emu->cpu, FLAG_C) ? 1U : 0U;
-        uint32_t result = (hl - value - (uint32_t)borrow) & 0xFFFFU;
-        set_flags_sub16(&emu->cpu, hl, value, result, borrow);
-        z80_set_hl(&emu->cpu, (uint16_t)result);
+        uint32_t result = (lhs - rhs - (uint32_t)borrow) & 0xFFFFU;
+        set_flags_sub16(&emu->cpu, lhs, rhs, result, borrow);
+        z80_set_hl_variant(&emu->cpu, mode, (uint16_t)result);
         return 15;
     }
     case 0x4A:
@@ -2043,12 +2107,12 @@ static int execute_ed_prefixed(Emulator *emu)
     case 0x6A:
     case 0x7A: {
         uint8_t pair = (opcode >> 4) & 0x03U;
-        uint32_t hl = z80_hl(&emu->cpu);
-        uint32_t value = z80_get_pair(&emu->cpu, pair);
+        uint32_t lhs = z80_get_hl_variant(&emu->cpu, mode);
+        uint32_t rhs = z80_ed_get_pair(&emu->cpu, pair, mode);
         uint8_t carry_in = flag_set(&emu->cpu, FLAG_C) ? 1U : 0U;
-        uint32_t result = hl + value + (uint32_t)carry_in;
-        set_flags_add16(&emu->cpu, hl, value, result, carry_in);
-        z80_set_hl(&emu->cpu, (uint16_t)result);
+        uint32_t result = lhs + rhs + (uint32_t)carry_in;
+        set_flags_add16(&emu->cpu, lhs, rhs, result, carry_in);
+        z80_set_hl_variant(&emu->cpu, mode, (uint16_t)result);
         return 15;
     }
     case 0x43:
@@ -2057,7 +2121,7 @@ static int execute_ed_prefixed(Emulator *emu)
     case 0x73: {
         uint8_t pair = (opcode >> 4) & 0x03U;
         uint16_t addr = fetch16(emu);
-        uint16_t value = z80_get_pair(&emu->cpu, pair);
+        uint16_t value = z80_ed_get_pair(&emu->cpu, pair, mode);
         memory_write16(emu, addr, value);
         return 20;
     }
@@ -2068,11 +2132,11 @@ static int execute_ed_prefixed(Emulator *emu)
         uint8_t pair = (opcode >> 4) & 0x03U;
         uint16_t addr = fetch16(emu);
         uint16_t value = memory_read16(emu, addr);
-        z80_set_pair(&emu->cpu, pair, value);
+        z80_ed_set_pair(&emu->cpu, pair, mode, value);
         return 20;
     }
     case 0xA0: {
-        uint16_t hl = z80_hl(&emu->cpu);
+        uint16_t hl = z80_get_hl_variant(&emu->cpu, mode);
         uint16_t de = z80_de(&emu->cpu);
         uint16_t bc = z80_bc(&emu->cpu);
         uint8_t value = memory_read8(emu, hl);
@@ -2080,7 +2144,7 @@ static int execute_ed_prefixed(Emulator *emu)
         hl = (uint16_t)(hl + 1U);
         de = (uint16_t)(de + 1U);
         bc = (uint16_t)(bc - 1U);
-        z80_set_hl(&emu->cpu, hl);
+        z80_set_hl_variant(&emu->cpu, mode, hl);
         z80_set_de(&emu->cpu, de);
         z80_set_bc(&emu->cpu, bc);
         set_flag(&emu->cpu, FLAG_H, false);
@@ -2089,7 +2153,7 @@ static int execute_ed_prefixed(Emulator *emu)
         return 16;
     }
     case 0xB0: {
-        uint16_t hl = z80_hl(&emu->cpu);
+        uint16_t hl = z80_get_hl_variant(&emu->cpu, mode);
         uint16_t de = z80_de(&emu->cpu);
         uint16_t bc = z80_bc(&emu->cpu);
         uint8_t value = memory_read8(emu, hl);
@@ -2097,7 +2161,7 @@ static int execute_ed_prefixed(Emulator *emu)
         hl = (uint16_t)(hl + 1U);
         de = (uint16_t)(de + 1U);
         bc = (uint16_t)(bc - 1U);
-        z80_set_hl(&emu->cpu, hl);
+        z80_set_hl_variant(&emu->cpu, mode, hl);
         z80_set_de(&emu->cpu, de);
         z80_set_bc(&emu->cpu, bc);
         set_flag(&emu->cpu, FLAG_H, false);
@@ -2110,7 +2174,7 @@ static int execute_ed_prefixed(Emulator *emu)
         return 16;
     }
     case 0xA8: {
-        uint16_t hl = z80_hl(&emu->cpu);
+        uint16_t hl = z80_get_hl_variant(&emu->cpu, mode);
         uint16_t de = z80_de(&emu->cpu);
         uint16_t bc = z80_bc(&emu->cpu);
         uint8_t value = memory_read8(emu, hl);
@@ -2118,7 +2182,7 @@ static int execute_ed_prefixed(Emulator *emu)
         hl = (uint16_t)(hl - 1U);
         de = (uint16_t)(de - 1U);
         bc = (uint16_t)(bc - 1U);
-        z80_set_hl(&emu->cpu, hl);
+        z80_set_hl_variant(&emu->cpu, mode, hl);
         z80_set_de(&emu->cpu, de);
         z80_set_bc(&emu->cpu, bc);
         set_flag(&emu->cpu, FLAG_H, false);
@@ -2127,7 +2191,7 @@ static int execute_ed_prefixed(Emulator *emu)
         return 16;
     }
     case 0xB8: {
-        uint16_t hl = z80_hl(&emu->cpu);
+        uint16_t hl = z80_get_hl_variant(&emu->cpu, mode);
         uint16_t de = z80_de(&emu->cpu);
         uint16_t bc = z80_bc(&emu->cpu);
         uint8_t value = memory_read8(emu, hl);
@@ -2135,7 +2199,7 @@ static int execute_ed_prefixed(Emulator *emu)
         hl = (uint16_t)(hl - 1U);
         de = (uint16_t)(de - 1U);
         bc = (uint16_t)(bc - 1U);
-        z80_set_hl(&emu->cpu, hl);
+        z80_set_hl_variant(&emu->cpu, mode, hl);
         z80_set_de(&emu->cpu, de);
         z80_set_bc(&emu->cpu, bc);
         set_flag(&emu->cpu, FLAG_H, false);
@@ -2148,28 +2212,28 @@ static int execute_ed_prefixed(Emulator *emu)
         return 16;
     }
     case 0xA1: {
-        uint16_t hl = z80_hl(&emu->cpu);
+        uint16_t hl = z80_get_hl_variant(&emu->cpu, mode);
         uint16_t bc = z80_bc(&emu->cpu);
         uint8_t value = memory_read8(emu, hl);
         bool carry = flag_set(&emu->cpu, FLAG_C);
         z80_sub_a(&emu->cpu, value, 0U, false);
         bc = (uint16_t)(bc - 1U);
         hl = (uint16_t)(hl + 1U);
-        z80_set_hl(&emu->cpu, hl);
+        z80_set_hl_variant(&emu->cpu, mode, hl);
         z80_set_bc(&emu->cpu, bc);
         set_flag(&emu->cpu, FLAG_PV, bc != 0U);
         set_flag(&emu->cpu, FLAG_C, carry);
         return 16;
     }
     case 0xB1: {
-        uint16_t hl = z80_hl(&emu->cpu);
+        uint16_t hl = z80_get_hl_variant(&emu->cpu, mode);
         uint16_t bc = z80_bc(&emu->cpu);
         uint8_t value = memory_read8(emu, hl);
         bool carry = flag_set(&emu->cpu, FLAG_C);
         z80_sub_a(&emu->cpu, value, 0U, false);
         bc = (uint16_t)(bc - 1U);
         hl = (uint16_t)(hl + 1U);
-        z80_set_hl(&emu->cpu, hl);
+        z80_set_hl_variant(&emu->cpu, mode, hl);
         z80_set_bc(&emu->cpu, bc);
         set_flag(&emu->cpu, FLAG_PV, bc != 0U);
         set_flag(&emu->cpu, FLAG_C, carry);
@@ -2180,28 +2244,28 @@ static int execute_ed_prefixed(Emulator *emu)
         return 16;
     }
     case 0xA9: {
-        uint16_t hl = z80_hl(&emu->cpu);
+        uint16_t hl = z80_get_hl_variant(&emu->cpu, mode);
         uint16_t bc = z80_bc(&emu->cpu);
         uint8_t value = memory_read8(emu, hl);
         bool carry = flag_set(&emu->cpu, FLAG_C);
         z80_sub_a(&emu->cpu, value, 0U, false);
         bc = (uint16_t)(bc - 1U);
         hl = (uint16_t)(hl - 1U);
-        z80_set_hl(&emu->cpu, hl);
+        z80_set_hl_variant(&emu->cpu, mode, hl);
         z80_set_bc(&emu->cpu, bc);
         set_flag(&emu->cpu, FLAG_PV, bc != 0U);
         set_flag(&emu->cpu, FLAG_C, carry);
         return 16;
     }
     case 0xB9: {
-        uint16_t hl = z80_hl(&emu->cpu);
+        uint16_t hl = z80_get_hl_variant(&emu->cpu, mode);
         uint16_t bc = z80_bc(&emu->cpu);
         uint8_t value = memory_read8(emu, hl);
         bool carry = flag_set(&emu->cpu, FLAG_C);
         z80_sub_a(&emu->cpu, value, 0U, false);
         bc = (uint16_t)(bc - 1U);
         hl = (uint16_t)(hl - 1U);
-        z80_set_hl(&emu->cpu, hl);
+        z80_set_hl_variant(&emu->cpu, mode, hl);
         z80_set_bc(&emu->cpu, bc);
         set_flag(&emu->cpu, FLAG_PV, bc != 0U);
         set_flag(&emu->cpu, FLAG_C, carry);
@@ -2749,7 +2813,7 @@ static int execute_primary_opcode(Emulator *emu, uint8_t opcode, uint16_t pc)
         return 4;
     }
     case 0xED:
-        return execute_ed_prefixed(emu);
+        return execute_ed_prefixed(emu, INDEX_MODE_HL);
     case 0xEE: {
         uint8_t value = fetch8(emu);
         z80_xor_a(&emu->cpu, value);

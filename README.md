@@ -5,7 +5,7 @@ This repository focuses on a compact Z80 CPU core intended for experimenting wit
 
 The current state includes:
 
-- A CPU core that implements the full 8080 instruction set along with the Z80 rotate/bit (`CB`) and block transfer/compare (`ED`) groups required by CP/M system binaries, including recent additions such as `NEG`, `RETN`/`RETI`, interrupt mode selection (`IM n`), register transfers with `I`/`R`, the decimal rotate helpers `RRD`/`RLD`, and initial IX/IY-prefixed register and ALU operations.
+- A CPU core that implements the full 8080 instruction set along with the Z80 rotate/bit (`CB`) and block transfer/compare (`ED`) groups required by CP/M system binaries, including recent additions such as `NEG`, `RETN`/`RETI`, interrupt mode selection (`IM n`), register transfers with `I`/`R`, the decimal rotate helpers `RRD`/`RLD`, and comprehensive IX/IY-prefixed arithmetic, load, and block instructions.
 - A flat 64 KiB memory map suitable for early CP/M programs.
 - A stubbed disk drive abstraction that can read or write raw sector data from a disk image, paving the way for future BDOS and BIOS emulation.
 - CP/M-style BIOS warm boot and BDOS entry points that translate console and file calls into host operations so simple programs can interact with the environment.
@@ -62,17 +62,17 @@ make example
 ```
 
 Successful runs show the `Hello from CP/M!` greeting, demonstrating that the command console trampolines are still wired
-correctly and that the recently implemented Z80 `ED` and index-prefixed helpers behave as expected in a real program.
+correctly and that the expanded Z80 `ED` and IX/IY-prefixed helpers behave as expected in a real program.
 
 Useful command-line options:
 
 - `--cycles N` – Limit execution to `N` T-states before halting automatically (default: 1,000,000).
 - `--disk-a path` – Mount a raw disk image for future BIOS/BDOS integration.
 
-Because many index (`DD`/`FD`) prefixed opcodes and most peripheral behaviours are still incomplete, running an arbitrary CP/M program can still terminate with an "Unimplemented opcode" message. This is intentional at this stage so missing instructions can be filled in incrementally.
+Because most peripheral behaviours and a handful of less common opcodes are still incomplete, running an arbitrary CP/M program can still terminate with an "Unimplemented opcode" message. This is intentional at this stage so the remaining gaps can be filled in incrementally.
 
 ## Next steps
-- Finish implementing the IX/IY-prefixed arithmetic, load, and block instructions so CP/M system programs (such as the CCP and BDOS) execute without hitting the "Unimplemented opcode" trap.
+- Exercise the newly implemented IX/IY-prefixed paths with full CP/M system images (CCP, BDOS, and BIOS) to flush out any remaining integration bugs before expanding device emulation.
 - Flesh out disk access helpers with sector caching, directory parsing, and optional disk geometry configuration, then wire them into the BDOS trampolines used by the console example.
 - Replace the manual smoke test with an automated integration test that assembles the example program, runs it under the emulator, and asserts on the captured console output to prevent regressions in flag handling for recently added ED-prefixed opcodes.
 
