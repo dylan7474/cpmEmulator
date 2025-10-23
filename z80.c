@@ -1,3 +1,4 @@
+#include <ctype.h>
 #include <errno.h>
 #include <inttypes.h>
 #include <stdbool.h>
@@ -10,6 +11,10 @@
 #define MEMORY_SIZE 0x10000U
 #define CP_M_LOAD_ADDRESS 0x0100U
 #define DEFAULT_MAX_CYCLES 1000000ULL
+#define CP_M_BIOS_ENTRY 0x0000U
+#define CP_M_BDOS_ENTRY 0x0005U
+#define CP_M_DEFAULT_DMA 0x0080U
+#define CP_M_MAX_OPEN_FILES 16
 
 typedef struct {
     uint8_t a;
@@ -40,9 +45,18 @@ typedef struct {
 } Z80;
 
 typedef struct {
+    bool in_use;
+    bool read_only;
+    uint16_t fcb_address;
+    FILE *fp;
+} CpmFileHandle;
+
+typedef struct {
     Z80 cpu;
     uint8_t memory[MEMORY_SIZE];
     DiskDrive disk_a;
+    uint16_t dma_address;
+    CpmFileHandle files[CP_M_MAX_OPEN_FILES];
 } Emulator;
 
 static inline uint16_t z80_bc(const Z80 *cpu)
@@ -174,6 +188,478 @@ static inline void memory_write16(Emulator *emu, uint16_t address, uint16_t valu
 {
     emu->memory[address] = (uint8_t)(value & 0xFFU);
     emu->memory[(uint16_t)(address + 1U)] = (uint8_t)((value >> 8) & 0xFFU);
+}
+
+static uint16_t cpm_pop16(Emulator *emu)
+{
+    uint16_t value = memory_read16(emu, emu->cpu.sp);
+    emu->cpu.sp = (uint16_t)(emu->cpu.sp + 2U);
+    return value;
+}
+
+static void cpm_return_from_call(Emulator *emu)
+{
+    uint16_t ret = cpm_pop16(emu);
+    emu->cpu.pc = ret;
+}
+
+static void cpm_reset_fcb_position(Emulator *emu, uint16_t fcb_address)
+{
+    memory_write8(emu, (uint16_t)(fcb_address + 12U), 0U);
+    memory_write8(emu, (uint16_t)(fcb_address + 32U), 0U);
+    memory_write8(emu, (uint16_t)(fcb_address + 33U), 0U);
+    memory_write8(emu, (uint16_t)(fcb_address + 34U), 0U);
+    memory_write8(emu, (uint16_t)(fcb_address + 35U), 0U);
+}
+
+static bool cpm_parse_fcb_filename(const Emulator *emu, uint16_t fcb_address, char *buffer, size_t size)
+{
+    if (buffer == NULL || size == 0U) {
+        return false;
+    }
+
+    char name[9];
+    char ext[4];
+
+    for (size_t i = 0; i < 8; ++i) {
+        name[i] = (char)memory_read8(emu, (uint16_t)(fcb_address + 1U + i));
+    }
+    name[8] = '\0';
+
+    size_t name_end = 8U;
+    while (name_end > 0U && (name[name_end - 1U] == ' ' || name[name_end - 1U] == '\0')) {
+        --name_end;
+    }
+    name[name_end] = '\0';
+    for (size_t i = 0; i < name_end; ++i) {
+        name[i] = (char)tolower((unsigned char)name[i]);
+    }
+
+    for (size_t i = 0; i < 3; ++i) {
+        ext[i] = (char)memory_read8(emu, (uint16_t)(fcb_address + 9U + i));
+    }
+    ext[3] = '\0';
+
+    size_t ext_end = 3U;
+    while (ext_end > 0U && (ext[ext_end - 1U] == ' ' || ext[ext_end - 1U] == '\0')) {
+        --ext_end;
+    }
+    ext[ext_end] = '\0';
+    for (size_t i = 0; i < ext_end; ++i) {
+        ext[i] = (char)tolower((unsigned char)ext[i]);
+    }
+
+    if (name_end == 0U) {
+        return false;
+    }
+
+    int written;
+    if (ext_end > 0U) {
+        written = snprintf(buffer, size, "%s.%s", name, ext);
+    } else {
+        written = snprintf(buffer, size, "%s", name);
+    }
+
+    if (written < 0) {
+        return false;
+    }
+
+    return (size_t)written < size;
+}
+
+static CpmFileHandle *cpm_find_file(Emulator *emu, uint16_t fcb_address)
+{
+    for (size_t i = 0; i < CP_M_MAX_OPEN_FILES; ++i) {
+        if (emu->files[i].in_use && emu->files[i].fcb_address == fcb_address) {
+            return &emu->files[i];
+        }
+    }
+
+    return NULL;
+}
+
+static CpmFileHandle *cpm_allocate_file(Emulator *emu, uint16_t fcb_address)
+{
+    CpmFileHandle *existing = cpm_find_file(emu, fcb_address);
+    if (existing != NULL) {
+        return existing;
+    }
+
+    for (size_t i = 0; i < CP_M_MAX_OPEN_FILES; ++i) {
+        if (!emu->files[i].in_use) {
+            emu->files[i].in_use = true;
+            emu->files[i].fcb_address = fcb_address;
+            emu->files[i].read_only = false;
+            emu->files[i].fp = NULL;
+            return &emu->files[i];
+        }
+    }
+
+    return NULL;
+}
+
+static void cpm_release_file(CpmFileHandle *handle)
+{
+    if (handle == NULL) {
+        return;
+    }
+
+    if (handle->fp != NULL) {
+        fclose(handle->fp);
+        handle->fp = NULL;
+    }
+
+    handle->in_use = false;
+    handle->read_only = false;
+    handle->fcb_address = 0U;
+}
+
+static void cpm_close_all_files(Emulator *emu)
+{
+    for (size_t i = 0; i < CP_M_MAX_OPEN_FILES; ++i) {
+        if (emu->files[i].in_use) {
+            if (emu->files[i].fp != NULL) {
+                fclose(emu->files[i].fp);
+                emu->files[i].fp = NULL;
+            }
+            emu->files[i].in_use = false;
+            emu->files[i].read_only = false;
+            emu->files[i].fcb_address = 0U;
+        }
+    }
+}
+
+static void cpm_advance_record(Emulator *emu, uint16_t fcb_address)
+{
+    uint8_t current = memory_read8(emu, (uint16_t)(fcb_address + 32U));
+    current = (uint8_t)(current + 1U);
+    memory_write8(emu, (uint16_t)(fcb_address + 32U), current);
+
+    if (current == 0U) {
+        uint8_t extend = memory_read8(emu, (uint16_t)(fcb_address + 12U));
+        extend = (uint8_t)(extend + 1U);
+        memory_write8(emu, (uint16_t)(fcb_address + 12U), extend);
+    }
+}
+
+static uint8_t cpm_bdos_open_file(Emulator *emu, uint16_t fcb_address)
+{
+    char filename[32];
+    if (!cpm_parse_fcb_filename(emu, fcb_address, filename, sizeof(filename))) {
+        return 0xFFU;
+    }
+
+    CpmFileHandle *handle = cpm_allocate_file(emu, fcb_address);
+    if (handle == NULL) {
+        return 0xFFU;
+    }
+
+    if (handle->fp != NULL) {
+        fclose(handle->fp);
+        handle->fp = NULL;
+    }
+
+    FILE *fp = fopen(filename, "r+b");
+    if (fp == NULL) {
+        fp = fopen(filename, "rb");
+        if (fp == NULL) {
+            handle->in_use = false;
+            handle->fcb_address = 0U;
+            return 0xFFU;
+        }
+        handle->read_only = true;
+    } else {
+        handle->read_only = false;
+    }
+
+    handle->fp = fp;
+    cpm_reset_fcb_position(emu, fcb_address);
+    (void)fseek(fp, 0L, SEEK_SET);
+    return 0x00U;
+}
+
+static uint8_t cpm_bdos_close_file(Emulator *emu, uint16_t fcb_address)
+{
+    CpmFileHandle *handle = cpm_find_file(emu, fcb_address);
+    if (handle == NULL || handle->fp == NULL) {
+        return 0xFFU;
+    }
+
+    fflush(handle->fp);
+    fclose(handle->fp);
+    handle->fp = NULL;
+    handle->in_use = false;
+    handle->read_only = false;
+    handle->fcb_address = 0U;
+    return 0x00U;
+}
+
+static uint8_t cpm_bdos_make_file(Emulator *emu, uint16_t fcb_address)
+{
+    char filename[32];
+    if (!cpm_parse_fcb_filename(emu, fcb_address, filename, sizeof(filename))) {
+        return 0xFFU;
+    }
+
+    CpmFileHandle *handle = cpm_allocate_file(emu, fcb_address);
+    if (handle == NULL) {
+        return 0xFFU;
+    }
+
+    if (handle->fp != NULL) {
+        fclose(handle->fp);
+        handle->fp = NULL;
+    }
+
+    FILE *fp = fopen(filename, "w+b");
+    if (fp == NULL) {
+        handle->in_use = false;
+        handle->fcb_address = 0U;
+        return 0xFFU;
+    }
+
+    handle->fp = fp;
+    handle->read_only = false;
+    cpm_reset_fcb_position(emu, fcb_address);
+    return 0x00U;
+}
+
+static uint8_t cpm_bdos_delete_file(Emulator *emu, uint16_t fcb_address)
+{
+    char filename[32];
+    if (!cpm_parse_fcb_filename(emu, fcb_address, filename, sizeof(filename))) {
+        return 0xFFU;
+    }
+
+    CpmFileHandle *handle = cpm_find_file(emu, fcb_address);
+    if (handle != NULL) {
+        cpm_release_file(handle);
+    }
+
+    return (remove(filename) == 0) ? 0x00U : 0xFFU;
+}
+
+static uint8_t cpm_bdos_read_sequential(Emulator *emu, uint16_t fcb_address)
+{
+    CpmFileHandle *handle = cpm_find_file(emu, fcb_address);
+    if (handle == NULL || handle->fp == NULL) {
+        return 0xFFU;
+    }
+
+    uint8_t buffer[128];
+    size_t read = fread(buffer, 1U, sizeof(buffer), handle->fp);
+    if (read == 0U) {
+        return 0x01U;
+    }
+
+    for (size_t i = 0; i < read; ++i) {
+        memory_write8(emu, (uint16_t)(emu->dma_address + i), buffer[i]);
+    }
+    for (size_t i = read; i < sizeof(buffer); ++i) {
+        memory_write8(emu, (uint16_t)(emu->dma_address + i), 0x1AU);
+    }
+
+    cpm_advance_record(emu, fcb_address);
+
+    return 0x00U;
+}
+
+static uint8_t cpm_bdos_write_sequential(Emulator *emu, uint16_t fcb_address)
+{
+    CpmFileHandle *handle = cpm_find_file(emu, fcb_address);
+    if (handle == NULL || handle->fp == NULL || handle->read_only) {
+        return 0xFFU;
+    }
+
+    uint8_t buffer[128];
+    for (size_t i = 0; i < sizeof(buffer); ++i) {
+        buffer[i] = memory_read8(emu, (uint16_t)(emu->dma_address + i));
+    }
+
+    size_t written = fwrite(buffer, 1U, sizeof(buffer), handle->fp);
+    if (written != sizeof(buffer)) {
+        return 0x01U;
+    }
+
+    fflush(handle->fp);
+    cpm_advance_record(emu, fcb_address);
+    return 0x00U;
+}
+
+static uint8_t cpm_bdos_rename_file(Emulator *emu, uint16_t fcb_address)
+{
+    char source[32];
+    char dest[32];
+
+    if (!cpm_parse_fcb_filename(emu, fcb_address, source, sizeof(source))) {
+        return 0xFFU;
+    }
+
+    if (!cpm_parse_fcb_filename(emu, (uint16_t)(fcb_address + 16U), dest, sizeof(dest))) {
+        return 0xFFU;
+    }
+
+    CpmFileHandle *src_handle = cpm_find_file(emu, fcb_address);
+    if (src_handle != NULL) {
+        cpm_release_file(src_handle);
+    }
+
+    return (rename(source, dest) == 0) ? 0x00U : 0xFFU;
+}
+
+static uint8_t cpm_bdos_set_dma(Emulator *emu, uint16_t address)
+{
+    emu->dma_address = address;
+    return 0x00U;
+}
+
+static void cpm_bdos_output_string(Emulator *emu, uint16_t address)
+{
+    for (;;) {
+        uint8_t value = memory_read8(emu, address);
+        if (value == '$') {
+            break;
+        }
+
+        putchar((int)value);
+        address = (uint16_t)(address + 1U);
+    }
+
+    fflush(stdout);
+}
+
+static void cpm_bdos_read_line(Emulator *emu, uint16_t address)
+{
+    uint8_t max_len = memory_read8(emu, address);
+    uint16_t offset = (uint16_t)(address + 2U);
+    uint8_t count = 0U;
+
+    for (;;) {
+        int ch = getchar();
+        if (ch == EOF || ch == '\n' || ch == '\r') {
+            break;
+        }
+
+        if (count < max_len) {
+            memory_write8(emu, (uint16_t)(offset + count), (uint8_t)ch);
+            ++count;
+        }
+    }
+
+    memory_write8(emu, (uint16_t)(address + 1U), count);
+    memory_write8(emu, (uint16_t)(offset + count), '\r');
+}
+
+static int handle_bios_call(Emulator *emu)
+{
+    emu->cpu.halted = true;
+    return 11;
+}
+
+static int handle_bdos_call(Emulator *emu)
+{
+    uint8_t function = emu->cpu.c;
+    uint16_t de = z80_de(&emu->cpu);
+    uint8_t return_code = 0x00U;
+    bool store_return = true;
+
+    switch (function) {
+    case 0x00:
+        emu->cpu.halted = true;
+        break;
+    case 0x01: {
+        int ch = getchar();
+        if (ch == EOF) {
+            ch = 0x1A;
+        }
+        emu->cpu.a = (uint8_t)ch;
+        emu->cpu.l = (uint8_t)ch;
+        store_return = false;
+        break;
+    }
+    case 0x02:
+        putchar((int)emu->cpu.e);
+        fflush(stdout);
+        return_code = emu->cpu.e;
+        break;
+    case 0x06:
+        if (emu->cpu.e == 0xFFU) {
+            int ch = getchar();
+            if (ch == EOF) {
+                ch = 0x00;
+            }
+            emu->cpu.a = (uint8_t)ch;
+            emu->cpu.l = (uint8_t)ch;
+            store_return = false;
+        } else {
+            putchar((int)emu->cpu.e);
+            fflush(stdout);
+            return_code = emu->cpu.e;
+        }
+        break;
+    case 0x09:
+        cpm_bdos_output_string(emu, de);
+        break;
+    case 0x0A:
+        cpm_bdos_read_line(emu, de);
+        break;
+    case 0x0B:
+        return_code = 0x00U;
+        break;
+    case 0x0C:
+        return_code = 0x22U;
+        break;
+    case 0x0F:
+        return_code = cpm_bdos_open_file(emu, de);
+        break;
+    case 0x10:
+        return_code = cpm_bdos_close_file(emu, de);
+        break;
+    case 0x13:
+        return_code = cpm_bdos_delete_file(emu, de);
+        break;
+    case 0x14:
+        return_code = cpm_bdos_read_sequential(emu, de);
+        break;
+    case 0x15:
+        return_code = cpm_bdos_write_sequential(emu, de);
+        break;
+    case 0x16:
+        return_code = cpm_bdos_make_file(emu, de);
+        break;
+    case 0x17:
+        return_code = cpm_bdos_rename_file(emu, de);
+        break;
+    case 0x1A:
+        return_code = cpm_bdos_set_dma(emu, de);
+        break;
+    default:
+        return_code = 0xFFU;
+        break;
+    }
+
+    if (store_return) {
+        emu->cpu.a = return_code;
+        emu->cpu.l = return_code;
+    }
+
+    cpm_return_from_call(emu);
+    return 17;
+}
+
+static bool handle_cpm_entry(Emulator *emu, int *cycles)
+{
+    if (emu->cpu.pc == CP_M_BIOS_ENTRY) {
+        *cycles = handle_bios_call(emu);
+        return true;
+    }
+
+    if (emu->cpu.pc == CP_M_BDOS_ENTRY) {
+        *cycles = handle_bdos_call(emu);
+        return true;
+    }
+
+    return false;
 }
 
 static void handle_out(uint8_t port, uint8_t value);
@@ -979,6 +1465,11 @@ static int z80_step(Emulator *emu)
         return 4;
     }
 
+    int trap_cycles = 0;
+    if (handle_cpm_entry(emu, &trap_cycles)) {
+        return trap_cycles;
+    }
+
     uint16_t pc = emu->cpu.pc;
     uint8_t opcode = fetch8(emu);
 
@@ -1542,6 +2033,7 @@ static void emulator_init(Emulator *emu)
 {
     memset(emu, 0, sizeof(*emu));
     z80_reset(&emu->cpu);
+    emu->dma_address = CP_M_DEFAULT_DMA;
 }
 
 static size_t load_binary(Emulator *emu, const char *path, uint16_t address)
@@ -1644,6 +2136,8 @@ int main(int argc, char **argv)
     }
 
     printf("Execution halted after %" PRIu64 " cycles at PC=0x%04X\n", cycles, emu.cpu.pc);
+
+    cpm_close_all_files(&emu);
 
     if (disk_is_mounted(&emu.disk_a)) {
         disk_unmount(&emu.disk_a);

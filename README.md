@@ -8,6 +8,7 @@ The current state includes:
 - A CPU core that implements the full 8080 instruction set along with the Z80 rotate/bit (`CB`) and block transfer/compare (`ED`) groups required by CP/M system binaries.
 - A flat 64 KiB memory map suitable for early CP/M programs.
 - A stubbed disk drive abstraction that can read or write raw sector data from a disk image, paving the way for future BDOS and BIOS emulation.
+- CP/M-style BIOS warm boot and BDOS entry points that translate console and file calls into host operations so simple programs can interact with the environment.
 
 Expect to extend the instruction coverage and peripheral behaviour as CP/M functionality is implemented.
 
@@ -41,7 +42,6 @@ Because index (`DD`/`FD`) prefixes and most peripheral behaviours are still stub
 
 ## Next steps
 - Broaden the instruction decoder until CP/M system programs (such as the CCP and BDOS) execute correctly.
-- Implement BIOS and BDOS entry points that translate CP/M calls into host file and console operations.
 - Flesh out disk access helpers with sector caching, directory parsing, and optional disk geometry configuration.
 
 Contributions that expand opcode coverage, improve testing, or add CP/M-compatible peripherals are welcome.
