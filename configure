@@ -25,6 +25,7 @@ printf "Checking build prerequisites...\n"
 
 check_tool gcc
 check_tool make
+check_tool python3
 
 if [[ $missing -ne 0 ]]; then
     printf "\nInstall the missing tools and rerun ./configure.\n"
