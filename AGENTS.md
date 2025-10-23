@@ -1,6 +1,8 @@
-# Spectrum Emulator Agent Instructions
+# CP/M Emulator Agent Instructions
 
 - Follow C11 conventions with 4-space indentation in C source files.
-- Prefer standard library calls and avoid platform-specific extensions unless wrapped in `#ifdef` guards.
-- Update `README.md` whenever build prerequisites or user-facing workflows change.
+- When updating `z80.c`, keep opcode handlers factored into helpers and match documented Z80 flag behaviour; extend decoder coverage in grouped helpers rather than expanding the top-level `switch` inline.
+- Prefer standard library calls and gate any platform-specific code behind `#ifdef` guards.
+- Update `README.md` whenever CLI options, instruction coverage, or other user-facing workflows change.
 - Shell scripts must use `#!/usr/bin/env bash` and start with `set -euo pipefail`.
+- Run `make` before committing changes that affect the emulator core.

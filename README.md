@@ -5,7 +5,7 @@ This repository now focuses on a compact Z80 CPU core intended for experimenting
 
 The current state includes:
 
-- A lightweight instruction decoder that supports a subset of the Z80 instruction set.
+- A CPU core that implements the full 8080 instruction set along with the Z80 rotate/bit (`CB`) and block transfer/compare (`ED`) groups required by CP/M system binaries.
 - A flat 64 KiB memory map suitable for early CP/M programs.
 - A stubbed disk drive abstraction that can read or write raw sector data from a disk image, paving the way for future BDOS and BIOS emulation.
 
@@ -37,7 +37,7 @@ Useful command-line options:
 - `--cycles N` – Limit execution to `N` T-states before halting automatically (default: 1,000,000).
 - `--disk-a path` – Mount a raw disk image for future BIOS/BDOS integration.
 
-Because only a subset of opcodes are implemented, running an arbitrary CP/M program will likely terminate with an "Unimplemented opcode" message. This is intentional at this stage so missing instructions can be filled in incrementally.
+Because index (`DD`/`FD`) prefixes and most peripheral behaviours are still stubbed out, running an arbitrary CP/M program can still terminate with an "Unimplemented opcode" message. This is intentional at this stage so missing instructions can be filled in incrementally.
 
 ## Next steps
 - Broaden the instruction decoder until CP/M system programs (such as the CCP and BDOS) execute correctly.
