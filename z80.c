@@ -57,6 +57,7 @@ typedef struct {
     uint8_t memory[MEMORY_SIZE];
     DiskDrive disk_a;
     uint16_t dma_address;
+    bool trap_cpm_calls;
     CpmFileHandle files[CP_M_MAX_OPEN_FILES];
 } Emulator;
 
@@ -650,6 +651,10 @@ static int handle_bdos_call(Emulator *emu)
 
 static bool handle_cpm_entry(Emulator *emu, int *cycles)
 {
+    if (!emu->trap_cpm_calls) {
+        return false;
+    }
+
     if (emu->cpu.pc == CP_M_BIOS_ENTRY) {
         *cycles = handle_bios_call(emu);
         return true;
@@ -2873,9 +2878,194 @@ static void emulator_init(Emulator *emu)
     memset(emu, 0, sizeof(*emu));
     z80_reset(&emu->cpu);
     emu->dma_address = CP_M_DEFAULT_DMA;
+    emu->trap_cpm_calls = true;
 }
 
-static size_t load_binary(Emulator *emu, const char *path, uint16_t address)
+static int hex_value(char ch)
+{
+    if (ch >= '0' && ch <= '9') {
+        return ch - '0';
+    }
+    if (ch >= 'A' && ch <= 'F') {
+        return ch - 'A' + 10;
+    }
+    if (ch >= 'a' && ch <= 'f') {
+        return ch - 'a' + 10;
+    }
+    return -1;
+}
+
+static bool parse_hex_byte(const char *text, uint8_t *value)
+{
+    int high = hex_value(text[0]);
+    int low = hex_value(text[1]);
+    if (high < 0 || low < 0) {
+        return false;
+    }
+    *value = (uint8_t)((high << 4) | low);
+    return true;
+}
+
+static bool parse_hex_word(const char *text, uint16_t *value)
+{
+    uint8_t high;
+    uint8_t low;
+    if (!parse_hex_byte(text, &high) || !parse_hex_byte(text + 2, &low)) {
+        return false;
+    }
+    *value = (uint16_t)((high << 8) | low);
+    return true;
+}
+
+static size_t load_intel_hex_file(Emulator *emu, const char *path)
+{
+    FILE *fp = fopen(path, "r");
+    if (fp == NULL) {
+        fprintf(stderr, "Failed to open %s: %s\n", path, strerror(errno));
+        return 0U;
+    }
+
+    char line[512];
+    uint32_t base = 0U;
+    size_t total = 0U;
+
+    while (fgets(line, sizeof(line), fp) != NULL) {
+        size_t len = strlen(line);
+        while (len > 0U && (line[len - 1U] == '\n' || line[len - 1U] == '\r')) {
+            line[--len] = '\0';
+        }
+
+        if (len == 0U) {
+            continue;
+        }
+
+        if (line[0] != ':') {
+            fprintf(stderr, "Invalid Intel HEX record in %s: missing ':'\n", path);
+            fclose(fp);
+            return 0U;
+        }
+
+        if (len < 11U) {
+            fprintf(stderr, "Invalid Intel HEX record in %s: line too short\n", path);
+            fclose(fp);
+            return 0U;
+        }
+
+        uint8_t byte_count;
+        uint16_t address16;
+        uint8_t record_type;
+        if (!parse_hex_byte(&line[1], &byte_count) || !parse_hex_word(&line[3], &address16)
+            || !parse_hex_byte(&line[7], &record_type)) {
+            fprintf(stderr, "Invalid Intel HEX record in %s: bad header fields\n", path);
+            fclose(fp);
+            return 0U;
+        }
+
+        size_t expected_len = 11U + (size_t)byte_count * 2U;
+        if (len < expected_len) {
+            fprintf(stderr, "Invalid Intel HEX record in %s: truncated data\n", path);
+            fclose(fp);
+            return 0U;
+        }
+
+        uint32_t sum = (uint32_t)byte_count + (uint32_t)(address16 >> 8) + (uint32_t)(address16 & 0xFFU)
+                        + (uint32_t)record_type;
+        uint8_t data_bytes[256];
+        size_t data_len = (size_t)byte_count;
+        if (data_len > sizeof(data_bytes)) {
+            fprintf(stderr, "Intel HEX record too large in %s\n", path);
+            fclose(fp);
+            return 0U;
+        }
+
+        for (size_t i = 0U; i < data_len; ++i) {
+            uint8_t value;
+            if (!parse_hex_byte(&line[9 + i * 2U], &value)) {
+                fprintf(stderr, "Invalid data byte in Intel HEX file %s\n", path);
+                fclose(fp);
+                return 0U;
+            }
+            data_bytes[i] = value;
+            sum += value;
+        }
+
+        uint8_t checksum;
+        if (!parse_hex_byte(&line[9 + data_len * 2U], &checksum)) {
+            fprintf(stderr, "Invalid checksum in Intel HEX file %s\n", path);
+            fclose(fp);
+            return 0U;
+        }
+
+        if (((sum + (uint32_t)checksum) & 0xFFU) != 0U) {
+            fprintf(stderr, "Checksum mismatch in Intel HEX file %s\n", path);
+            fclose(fp);
+            return 0U;
+        }
+
+        if (record_type == 0x00U) {
+            uint32_t absolute = base + (uint32_t)address16;
+            for (size_t i = 0U; i < data_len; ++i) {
+                uint32_t addr = absolute + (uint32_t)i;
+                if (addr >= MEMORY_SIZE) {
+                    fprintf(stderr, "Intel HEX load in %s exceeds memory at 0x%04X\n", path,
+                            (unsigned int)addr);
+                    fclose(fp);
+                    return 0U;
+                }
+                emu->memory[addr] = data_bytes[i];
+                ++total;
+            }
+        } else if (record_type == 0x01U) {
+            break;
+        } else if (record_type == 0x02U) {
+            if (byte_count != 2U) {
+                fprintf(stderr, "Invalid extended segment address record in %s\n", path);
+                fclose(fp);
+                return 0U;
+            }
+            uint16_t segment = (uint16_t)((data_bytes[0] << 8) | data_bytes[1]);
+            base = (uint32_t)segment << 4;
+            if (base >= MEMORY_SIZE) {
+                fprintf(stderr, "Extended segment base 0x%04X from %s exceeds memory\n",
+                        (unsigned int)segment, path);
+                fclose(fp);
+                return 0U;
+            }
+        } else if (record_type == 0x04U) {
+            if (byte_count != 2U) {
+                fprintf(stderr, "Invalid extended linear address record in %s\n", path);
+                fclose(fp);
+                return 0U;
+            }
+            uint16_t value = (uint16_t)((data_bytes[0] << 8) | data_bytes[1]);
+            base = (uint32_t)value << 16;
+            if (base >= MEMORY_SIZE) {
+                fprintf(stderr, "Extended linear base 0x%04X from %s exceeds memory\n",
+                        (unsigned int)value, path);
+                fclose(fp);
+                return 0U;
+            }
+        } else if (record_type == 0x05U) {
+            /* Start linear address record – ignore, entry point is provided separately. */
+        } else {
+            fprintf(stderr, "Unsupported Intel HEX record type 0x%02X in %s\n",
+                    record_type, path);
+            fclose(fp);
+            return 0U;
+        }
+    }
+
+    if (ferror(fp) != 0) {
+        fprintf(stderr, "Error reading Intel HEX file %s\n", path);
+        fclose(fp);
+        return 0U;
+    }
+
+    fclose(fp);
+    return total;
+}
+
+static size_t load_binary_file(Emulator *emu, const char *path, uint16_t address)
 {
     FILE *fp = fopen(path, "rb");
     if (fp == NULL) {
@@ -2894,13 +3084,22 @@ static size_t load_binary(Emulator *emu, const char *path, uint16_t address)
         total += chunk;
     }
 
+    if (offset >= MEMORY_SIZE && fgetc(fp) != EOF) {
+        fprintf(stderr, "Binary '%s' truncated while loading at 0x%04X\n", path, address);
+        fclose(fp);
+        return 0U;
+    }
+
     fclose(fp);
     return total;
 }
 
 static void usage(const char *prog)
 {
-    fprintf(stderr, "Usage: %s [--cycles N] [--disk-a path] program.bin\n", prog);
+    fprintf(stderr,
+            "Usage: %s [--cycles N] [--disk-a path] [--load addr:file] [--load-hex path]\n"
+            "           [--entry addr] [--no-cpm-traps] [program.bin]\n",
+            prog);
 }
 
 static uint64_t parse_cycles(const char *value)
@@ -2914,6 +3113,18 @@ static uint64_t parse_cycles(const char *value)
     return parsed;
 }
 
+static bool parse_uint16(const char *text, uint16_t *out)
+{
+    char *end = NULL;
+    unsigned long parsed = strtoul(text, &end, 0);
+    if (text[0] == '\0' || (end != NULL && *end != '\0') || parsed > 0xFFFFUL) {
+        return false;
+    }
+
+    *out = (uint16_t)parsed;
+    return true;
+}
+
 int main(int argc, char **argv)
 {
     Emulator emu;
@@ -2922,6 +3133,9 @@ int main(int argc, char **argv)
     const char *program_path = NULL;
     const char *disk_path = NULL;
     uint64_t max_cycles = DEFAULT_MAX_CYCLES;
+    uint16_t entry_point = CP_M_LOAD_ADDRESS;
+    bool entry_specified = false;
+    bool memory_loaded = false;
 
     for (int i = 1; i < argc; ++i) {
         if (strcmp(argv[i], "--cycles") == 0) {
@@ -2936,6 +3150,61 @@ int main(int argc, char **argv)
                 return EXIT_FAILURE;
             }
             disk_path = argv[++i];
+        } else if (strcmp(argv[i], "--load") == 0) {
+            if (i + 1 >= argc) {
+                usage(argv[0]);
+                return EXIT_FAILURE;
+            }
+            const char *spec = argv[++i];
+            const char *colon = strchr(spec, ':');
+            if (colon == NULL || colon == spec || colon[1] == '\0') {
+                fprintf(stderr, "Invalid --load argument '%s'\n", spec);
+                return EXIT_FAILURE;
+            }
+            char address_buf[32];
+            size_t len = (size_t)(colon - spec);
+            if (len >= sizeof(address_buf)) {
+                fprintf(stderr, "Address portion too long in --load argument '%s'\n", spec);
+                return EXIT_FAILURE;
+            }
+            memcpy(address_buf, spec, len);
+            address_buf[len] = '\0';
+            uint16_t address;
+            if (!parse_uint16(address_buf, &address)) {
+                fprintf(stderr, "Invalid load address '%s'\n", address_buf);
+                return EXIT_FAILURE;
+            }
+            const char *path = colon + 1;
+            size_t loaded = load_binary_file(&emu, path, address);
+            if (loaded == 0U) {
+                return EXIT_FAILURE;
+            }
+            memory_loaded = true;
+        } else if (strcmp(argv[i], "--load-hex") == 0) {
+            if (i + 1 >= argc) {
+                usage(argv[0]);
+                return EXIT_FAILURE;
+            }
+            const char *path = argv[++i];
+            size_t loaded = load_intel_hex_file(&emu, path);
+            if (loaded == 0U) {
+                return EXIT_FAILURE;
+            }
+            memory_loaded = true;
+        } else if (strcmp(argv[i], "--entry") == 0) {
+            if (i + 1 >= argc) {
+                usage(argv[0]);
+                return EXIT_FAILURE;
+            }
+            uint16_t address;
+            if (!parse_uint16(argv[++i], &address)) {
+                fprintf(stderr, "Invalid entry address '%s'\n", argv[i]);
+                return EXIT_FAILURE;
+            }
+            entry_point = address;
+            entry_specified = true;
+        } else if (strcmp(argv[i], "--no-cpm-traps") == 0) {
+            emu.trap_cpm_calls = false;
         } else if (strcmp(argv[i], "--help") == 0) {
             usage(argv[0]);
             return EXIT_SUCCESS;
@@ -2948,11 +3217,6 @@ int main(int argc, char **argv)
         }
     }
 
-    if (program_path == NULL) {
-        usage(argv[0]);
-        return EXIT_FAILURE;
-    }
-
     if (disk_path != NULL) {
         if (disk_mount(&emu.disk_a, disk_path, 26U, 128U) != 0) {
             fprintf(stderr, "Failed to mount disk image '%s'\n", disk_path);
@@ -2960,14 +3224,30 @@ int main(int argc, char **argv)
         }
     }
 
-    size_t loaded = load_binary(&emu, program_path, CP_M_LOAD_ADDRESS);
-    if (loaded == 0U) {
-        fprintf(stderr, "No bytes loaded from '%s'\n", program_path);
-        disk_unmount(&emu.disk_a);
+    if (program_path != NULL) {
+        size_t loaded = load_binary_file(&emu, program_path, CP_M_LOAD_ADDRESS);
+        if (loaded == 0U) {
+            if (disk_is_mounted(&emu.disk_a)) {
+                disk_unmount(&emu.disk_a);
+            }
+            fprintf(stderr, "No bytes loaded from '%s'\n", program_path);
+            return EXIT_FAILURE;
+        }
+        memory_loaded = true;
+        if (!entry_specified) {
+            entry_point = CP_M_LOAD_ADDRESS;
+        }
+    }
+
+    if (!memory_loaded) {
+        usage(argv[0]);
+        if (disk_is_mounted(&emu.disk_a)) {
+            disk_unmount(&emu.disk_a);
+        }
         return EXIT_FAILURE;
     }
 
-    emu.cpu.pc = CP_M_LOAD_ADDRESS;
+    emu.cpu.pc = entry_point;
 
     uint64_t cycles = 0ULL;
     while (!emu.cpu.halted && cycles < max_cycles) {

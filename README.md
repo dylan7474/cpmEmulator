@@ -68,11 +68,39 @@ Useful command-line options:
 
 - `--cycles N` – Limit execution to `N` T-states before halting automatically (default: 1,000,000).
 - `--disk-a path` – Mount a raw disk image for future BIOS/BDOS integration.
+- `--load addr:file` – Copy an additional binary into memory at `addr` (for example, to preload a ROM or BIOS image). This flag
+  may be repeated.
+- `--load-hex path` – Ingest an Intel HEX file at the addresses encoded in the records, which is convenient for CP/M system
+  distributions that ship in textual form.
+- `--entry addr` – Override the initial program counter. When absent, it defaults to the transient program area (`0x0100`) if a
+  standalone program is supplied.
+- `--no-cpm-traps` – Disable the host-side BDOS and BIOS shims so that genuine system images can run their own handlers.
 
 Because most peripheral behaviours and a handful of less common opcodes are still incomplete, running an arbitrary CP/M program can still terminate with an "Unimplemented opcode" message. This is intentional at this stage so the remaining gaps can be filled in incrementally.
 
+### Exercising CP/M system images
+
+To validate the IX/IY-prefixed instruction paths against real system software, load the canonical CP/M 2.2 components (CCP, BDOS, and BIOS) and execute them under the emulator. The binaries are available from the open-source reconstruction at [`brouhaha/cpm22`](https://github.com/brouhaha/cpm22). A typical workflow looks like:
+
+```bash
+mkdir -p third_party/cpm22
+curl -L https://raw.githubusercontent.com/brouhaha/cpm22/master/BUILD/ccp.hex -o third_party/cpm22/ccp.hex
+curl -L https://raw.githubusercontent.com/brouhaha/cpm22/master/BUILD/bdos.hex -o third_party/cpm22/bdos.hex
+curl -L https://raw.githubusercontent.com/brouhaha/cpm22/master/BUILD/bios.hex -o third_party/cpm22/bios.hex
+
+./z80 \
+  --no-cpm-traps \
+  --entry 0x0000 \
+  --load-hex third_party/cpm22/bios.hex \
+  --load-hex third_party/cpm22/bdos.hex \
+  --load-hex third_party/cpm22/ccp.hex \
+  --cycles 500000
+```
+
+The Intel HEX loader preserves the original placement encoded in each file, so no manual address bookkeeping is required. Booting with `--entry 0x0000` mimics the BIOS warm start vector while `--no-cpm-traps` ensures the resident CP/M code executes rather than the host-side shims. When the emulator completes without reporting unimplemented opcodes, the IX/IY-prefixed execution paths have been exercised against the full CP/M supervisor stack. Mount a disk image with `--disk-a` to extend the experiment to filesystem and console integration as new device emulation features land.
+
 ## Next steps
-- Exercise the newly implemented IX/IY-prefixed paths with full CP/M system images (CCP, BDOS, and BIOS) to flush out any remaining integration bugs before expanding device emulation.
+- Automate the CP/M system image exercise so regressions in the IX/IY-prefixed helpers are caught in CI.
 - Flesh out disk access helpers with sector caching, directory parsing, and optional disk geometry configuration, then wire them into the BDOS trampolines used by the console example.
 - Replace the manual smoke test with an automated integration test that assembles the example program, runs it under the emulator, and asserts on the captured console output to prevent regressions in flag handling for recently added ED-prefixed opcodes.
 
