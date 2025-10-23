@@ -1,164 +1,47 @@
-# Spectrum Emulator
+# CP/M-Oriented Z80 Emulator Core
 
 ## Overview
-This project is a homebrew ZX Spectrum emulator written in C with SDL2 for video, audio, and input. It focuses on accurately modelling the original hardware's Z80 CPU, display timing, and keyboard matrix while remaining small enough to hack on for learning and experimentation.
+This repository now focuses on a compact Z80 CPU core intended for experimenting with a CP/M environment. The goal is to provide a clean foundation for building a disk-backed CP/M emulator while keeping the code small enough to understand and extend. The previous ZX Spectrum specific video, audio, and tape systems have been removed in favour of a simple command-line tool that executes Z80 binaries.
+
+The current state includes:
+
+- A lightweight instruction decoder that supports a subset of the Z80 instruction set.
+- A flat 64 KiB memory map suitable for early CP/M programs.
+- A stubbed disk drive abstraction that can read or write raw sector data from a disk image, paving the way for future BDOS and BIOS emulation.
+
+Expect to extend the instruction coverage and peripheral behaviour as CP/M functionality is implemented.
 
 ## Prerequisites
-Before building, make sure the following tools and development headers are available:
+- A C11-compatible compiler (tested with `gcc`).
+- `make`.
 
-- `gcc` or another C11-compatible compiler
-- `make`
-- SDL2 development libraries (headers and runtime)
-- `pkg-config` to locate SDL2 on Unix-like systems
-- Optional: `sdl2-config` for additional configuration helpers on some platforms
-
-The provided `./configure` helper script can verify these dependencies and suggest installation commands on Linux distributions.
+Run `./configure` to confirm the prerequisites are available on your system.
 
 ## Building
-
-### Linux
-1. Run `./configure` to verify that the compiler and SDL2 development files are available.
-2. Build the emulator with `make`.
-3. The resulting executable (`z80`) will be placed in the project root.
-
-If you are working from the Codex environment used by the automation tooling in
-this repository, you can bootstrap the required dependencies and export sane
-defaults by running:
-
-```bash
-source scripts/codex_env.sh --install-deps --configure
+```
+./configure
+make
 ```
 
-Sourcing the script without arguments simply exports the recommended compiler
-flags while allowing you to manage dependencies manually.
-
-### Windows
-1. Ensure a POSIX-compatible shell environment such as MSYS2 or Cygwin with SDL2 development packages installed.
-2. Use `./configure` (optional on Windows) or confirm that `gcc`, `pkg-config`, and SDL2 are available in your environment.
-3. Build with `make -f Makefile.win` to produce the Windows binary.
+The build produces the `z80` executable in the project root.
 
 ## Running
-Launch the compiled executable from the command line with a 16 KB Spectrum ROM image:
+The emulator currently accepts a raw binary to load at the standard CP/M transient program area (`0x0100`). It executes instructions until a `HALT` is encountered or a cycle budget is exhausted.
 
-```bash
-./z80 path/to/48k.rom
+```
+./z80 path/to/program.bin
 ```
 
-If no ROM is specified the bundled `48.rom` image in the project root is used automatically. The emulator will load the ROM into memory and immediately begin execution once SDL initialisation succeeds.
+Useful command-line options:
 
-For audio debugging you can mirror the generated beeper samples to a WAV file with the optional dump flag:
+- `--cycles N` – Limit execution to `N` T-states before halting automatically (default: 1,000,000).
+- `--disk-a path` – Mount a raw disk image for future BIOS/BDOS integration.
 
-```bash
-./z80 --audio-dump beeper.wav path/to/48k.rom
-```
+Because only a subset of opcodes are implemented, running an arbitrary CP/M program will likely terminate with an "Unimplemented opcode" message. This is intentional at this stage so missing instructions can be filled in incrementally.
 
-The WAV stream is captured directly from the audio callback, allowing offline analysis with tools such as Audacity.
+## Next steps
+- Broaden the instruction decoder until CP/M system programs (such as the CCP and BDOS) execute correctly.
+- Implement BIOS and BDOS entry points that translate CP/M calls into host file and console operations.
+- Flesh out disk access helpers with sector caching, directory parsing, and optional disk geometry configuration.
 
-If you need to troubleshoot the beeper timing internals, pass `--beeper-log` to re-enable the detailed latency logs that are now
-disabled by default:
-
-```bash
-./z80 --beeper-log path/to/48k.rom
-```
-
-For cassette investigations, enable `--tape-debug` to mirror block metadata and
-the individual bits emitted during playback to stderr. The logs include header
-names, payload lengths, and MSB-first bit traces so you can confirm that TAP
-and TZX images expose the expected filenames and data ordering:
-
-```bash
-./z80 --tap loader.tap --tape-debug
-```
-
-## Testing
-
-The emulator ships with a lightweight CPU regression harness that exercises the undocumented opcode helpers and verifies
-interrupt sequencing. Run it directly from the binary:
-
-```bash
-./z80 --run-tests
-```
-
-The command returns a non-zero exit status if any unit check fails. Optional ZEXDOC/ZEXALL integration is available when the
-corresponding CP/M binaries are present. Place `zexdoc.com` and/or `zexall.com` inside `tests/roms/` (or point the harness at an
-alternate directory via `--test-rom-dir <dir>`), then rerun the test command to execute the suites and record their output.
-
-For convenience a dedicated make target wraps the test invocation:
-
-```bash
-make test
-```
-
-### Loading and saving tapes
-
-Real-time cassette emulation is available for standard `.tap` dumps, `.tzx` images that use standard speed data blocks, and mono PCM `.wav` captures. Supply
-one of the tape options when launching the emulator and the EAR input will be driven automatically during `LOAD`/`MERGE` calls:
-
-```bash
-./z80 --tap software.tap
-./z80 --tzx demo.tzx
-./z80 --wav digitized.wav
-```
-
-You can also skip the explicit flags and pass a tape image directly. The emulator
-infers `.tap`, `.tzx`, and `.wav` formats from positional arguments, so running
-`./z80 digitized.wav` loads the bundled ROM and cues the specified tape at
-startup.
-
-Loaded tapes remain cued at the start. Press **F5** to begin playback when the Spectrum is ready to `LOAD`, use **F6** to pause/stop, and tap **F7** to rewind to the beginning at any time.
-
-While a tape source or recording destination is configured, a status panel in the upper border shows the current deck mode and a running counter so you can monitor playback and capture progress without leaving the emulator window. The panel exposes on-screen play, stop, rewind, and record controls so you can drive the deck entirely with the mouse when preferred.
-
-To capture the MIC output generated by `SAVE`, provide `--save-tap` for a decoded `.tap` container or `--save-wav` for a raw audio
-dump. The emulator records the cassette pulses while the ROM routines execute and writes the selected format on exit:
-
-```bash
-./z80 --save-tap recording.tap
-./z80 --save-wav recording.wav
-```
-
-When a recording destination is configured, press **F8** or click the record button to arm the virtual deck. A normal press clears any previous capture, while holding **Shift** (or Shift-clicking the on-screen control) appends the new data to the existing WAV instead. If you have mounted a WAV image without passing `--save-wav`, the record control reuses that file so you can overwrite it or extend it in place.
-
-Loading and saving can be combined, allowing you to simultaneously play an input tape and archive new content:
-
-```bash
-./z80 --tap loader.tap --save-tap my_dump.tap
-./z80 --tzx loader.tzx --save-wav capture.wav
-./z80 --wav digitized.wav --save-tap restore.tap
-```
-
-The WAV loader expects mono 8- or 16-bit PCM streams and derives tape transitions by tracking zero-crossings, making it suitable for replaying the emulator's own `--save-wav` output or other digitized cassette recordings.
-
-At present the TZX reader accepts standard speed blocks (`0x10`). Future updates may broaden support for additional block types
-and direct snapshot formats.
-
-## Controls
-The emulator mirrors the original ZX Spectrum's keyboard matrix. The primary host-to-Spectrum key mapping is:
-
-| Spectrum Key Row | Host Keyboard |
-| ---------------- | -------------- |
-| Row 0            | Left Shift, Z, X, C, V |
-| Row 1            | A, S, D, F, G |
-| Row 2            | Q, W, E, R, T |
-| Row 3            | 1, 2, 3, 4, 5 |
-| Row 4            | 0, 9, 8, 7, 6 (Backspace emulates `SHIFT+0`) |
-| Row 5            | P, O, I, U, Y |
-| Row 6            | Enter, L, K, J, H |
-| Row 7            | Space, Left/Right Ctrl, M, N, B |
-
-Additional host shortcuts:
-
-- Close the emulator window or use your window manager's close button to exit.
-- Toggle the internal beeper through the Spectrum's standard `BEEP` command.
-- F5 Play, F6 Stop, F7 Rewind, F8 Record (Shift+F8 appends to the current WAV when available).
-
-## Roadmap
-- **Tape and snapshot formats** – Extend cassette support beyond standard-speed `.tap`/`.tzx` images by decoding additional TZX
-  block types such as turbo, custom tone, and direct recording data. Add popular snapshot containers (for example `.sna` and
-  `.z80`) so software that relies on quick-load images can launch without the tape deck entirely.
-- **CPU accuracy** – Implement the remaining undocumented Z80 opcodes and refine interrupt timing. Incorporate well-known test
-  suites (e.g. ZEXDOC/ZEXALL or `z80full`) to continually validate the execution core while tightening cycle-level behaviour.
-- **Input flexibility** – Introduce configurable key bindings and emulate common joystick standards like Kempston, Sinclair, and
-  Interface 2 to broaden controller support for games.
-- **Automation and CI** – Capture the expanded CPU and tape behaviour in automated regression tests and stand up continuous
-  integration builds (Linux, Windows) so the emulator remains stable as new features land.
+Contributions that expand opcode coverage, improve testing, or add CP/M-compatible peripherals are welcome.

@@ -1,56 +1,22 @@
-#!/bin/sh
-# Simple dependency checker for the Spectrum Emulator build.
-
-set -u
+#!/usr/bin/env bash
+set -euo pipefail
 
 missing=0
 
 print_status() {
-    if [ "$1" -eq 0 ]; then
+    if [[ $1 -eq 0 ]]; then
         printf "[OK] %s\n" "$2"
     else
         printf "[MISSING] %s\n" "$2"
     fi
 }
 
-print_hints() {
-    case "$1" in
-        gcc)
-            printf "  Hint: Debian/Ubuntu -> sudo apt install build-essential\n"
-            printf "        Fedora/RHEL  -> sudo dnf install gcc make\n"
-            ;;
-        pkg-config)
-            printf "  Hint: Debian/Ubuntu -> sudo apt install pkg-config\n"
-            printf "        Fedora/RHEL  -> sudo dnf install pkgconf-pkg-config\n"
-            ;;
-        sdl2-config)
-            printf "  Hint: Debian/Ubuntu -> sudo apt install libsdl2-dev\n"
-            printf "        Fedora/RHEL  -> sudo dnf install SDL2-devel\n"
-            ;;
-        sdl2)
-            printf "  Hint: Debian/Ubuntu -> sudo apt install libsdl2-dev\n"
-            printf "        Fedora/RHEL  -> sudo dnf install SDL2-devel\n"
-            ;;
-    esac
-}
-
 check_tool() {
-    if command -v "$1" >/dev/null 2>&1; then
-        print_status 0 "$1 found at $(command -v "$1")"
+    local tool=$1
+    if command -v "$tool" >/dev/null 2>&1; then
+        print_status 0 "$tool found at $(command -v "$tool")"
     else
-        print_status 1 "$1 not found"
-        print_hints "$1"
-        missing=1
-    fi
-}
-
-check_pkg() {
-    if pkg-config --exists "$1"; then
-        version=$(pkg-config --modversion "$1" 2>/dev/null)
-        print_status 0 "pkg-config: $1 (version ${version:-unknown})"
-    else
-        print_status 1 "pkg-config: $1 not found"
-        print_hints "$1"
+        print_status 1 "$tool not found"
         missing=1
     fi
 }
@@ -58,19 +24,11 @@ check_pkg() {
 printf "Checking build prerequisites...\n"
 
 check_tool gcc
-check_tool pkg-config
-check_tool sdl2-config
+check_tool make
 
-if command -v pkg-config >/dev/null 2>&1; then
-    check_pkg sdl2
-else
-    printf "[SKIP] SDL2 pkg-config check skipped because pkg-config is missing.\n"
-fi
-
-if [ "$missing" -ne 0 ]; then
-    printf "\nOne or more required tools/libraries are missing. Please install the suggested packages and rerun ./configure.\n"
+if [[ $missing -ne 0 ]]; then
+    printf "\nInstall the missing tools and rerun ./configure.\n"
     exit 1
 fi
 
-printf "\nAll required build tools and libraries are available. You can now run 'make'.\n"
-exit 0
+printf "\nAll required build tools are available. You can now run 'make'.\n"
