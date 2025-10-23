@@ -1,7 +1,7 @@
 # CP/M-Oriented Z80 Emulator Core
 
 ## Overview
-This repository now focuses on a compact Z80 CPU core intended for experimenting with a CP/M environment. The goal is to provide a clean foundation for building a disk-backed CP/M emulator while keeping the code small enough to understand and extend. The previous ZX Spectrum specific video, audio, and tape systems have been removed in favour of a simple command-line tool that executes Z80 binaries.
+This repository focuses on a compact Z80 CPU core intended for experimenting with a CP/M environment. The goal is to provide a clean foundation for building a disk-backed CP/M emulator while keeping the code small enough to understand and extend. The previous ZX Spectrum specific video, audio, and tape systems have been removed in favour of a simple command-line tool that executes Z80 binaries.
 
 The current state includes:
 
