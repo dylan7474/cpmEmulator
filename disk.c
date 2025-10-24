@@ -5,6 +5,9 @@
 #include <stdlib.h>
 #include <string.h>
 
+static DiskStatus disk_cache_ensure(DiskDrive *drive, size_t track, size_t sector);
+static void disk_parse_directory_entry_bytes(const uint8_t raw[32], DiskDirectoryEntry *entry);
+
 static long compute_offset(const DiskDrive *drive, size_t track, size_t sector)
 {
     if (drive == NULL || drive->geometry.sectors_per_track == 0U || drive->geometry.sector_size == 0U) {
@@ -67,6 +70,16 @@ static void disk_reset_metadata(DiskDrive *drive)
     drive->directory_offset = 0U;
     drive->directory_entries = 0U;
     drive->allocation_vector_bytes = 0U;
+    drive->directory_metadata_bytes = 0U;
+    if (drive->directory_metadata != NULL) {
+        free(drive->directory_metadata);
+        drive->directory_metadata = NULL;
+    }
+    if (drive->allocation_vector_data != NULL) {
+        free(drive->allocation_vector_data);
+        drive->allocation_vector_data = NULL;
+    }
+    drive->allocation_vector_from_bios = false;
 }
 
 static void disk_compute_metadata(DiskDrive *drive)
@@ -210,6 +223,170 @@ static void disk_compute_metadata(DiskDrive *drive)
     drive->directory_offset = reserved_tracks * track_bytes;
     drive->directory_entries = dir_entries;
     drive->allocation_vector_bytes = (size_t)((block_count + 7U) / 8U);
+    drive->directory_metadata_bytes = dir_entries * 32U;
+}
+
+static size_t disk_map_logical_sector(const DiskDrive *drive, size_t logical_sector)
+{
+    if (drive == NULL || drive->geometry.sectors_per_track == 0U) {
+        return logical_sector;
+    }
+
+    if (drive->translation_table != NULL && drive->translation_table_entries == drive->geometry.sectors_per_track) {
+        if (logical_sector < drive->translation_table_entries) {
+            return drive->translation_table[logical_sector];
+        }
+    }
+
+    return logical_sector;
+}
+
+static void disk_mark_block_allocated(DiskDrive *drive, uint16_t block)
+{
+    if (drive == NULL || drive->allocation_vector_data == NULL || !drive->parameter_block_valid) {
+        return;
+    }
+
+    uint16_t max_block = drive->parameter_block.dsm;
+    if (block > max_block) {
+        return;
+    }
+
+    size_t byte_index = block / 8U;
+    size_t bit_index = block % 8U;
+    if (byte_index >= drive->allocation_vector_bytes) {
+        return;
+    }
+
+    uint8_t mask = (uint8_t)(0x80U >> bit_index);
+    drive->allocation_vector_data[byte_index] |= mask;
+}
+
+static void disk_recompute_allocation_vector(DiskDrive *drive)
+{
+    if (drive == NULL || drive->allocation_vector_data == NULL || drive->directory_metadata == NULL) {
+        return;
+    }
+
+    if (drive->allocation_vector_bytes == 0U || !drive->parameter_block_valid) {
+        return;
+    }
+
+    memset(drive->allocation_vector_data, 0, drive->allocation_vector_bytes);
+
+    size_t entry_count = drive->directory_entries;
+    size_t records_per_block = drive->block_records;
+    if (records_per_block == 0U) {
+        records_per_block = 1U;
+    }
+
+    for (size_t i = 0U; i < entry_count; ++i) {
+        const uint8_t *raw = &drive->directory_metadata[i * 32U];
+        DiskDirectoryEntry entry;
+        disk_parse_directory_entry_bytes(raw, &entry);
+
+        if (entry.is_empty || entry.is_deleted) {
+            continue;
+        }
+
+        size_t blocks_hint = (entry.record_count + records_per_block - 1U) / records_per_block;
+        if (blocks_hint > entry.allocation_count) {
+            blocks_hint = entry.allocation_count;
+        }
+
+        for (size_t j = 0U; j < entry.allocation_count; ++j) {
+            uint8_t block = entry.allocations[j];
+            if (block == 0U && j >= blocks_hint) {
+                continue;
+            }
+
+            disk_mark_block_allocated(drive, block);
+        }
+    }
+}
+
+static bool disk_refresh_directory_metadata(DiskDrive *drive)
+{
+    if (drive == NULL || drive->directory_metadata == NULL) {
+        return true;
+    }
+
+    if (drive->directory_metadata_bytes == 0U) {
+        return true;
+    }
+
+    size_t track_bytes = drive->geometry.sectors_per_track * drive->geometry.sector_size;
+    if (track_bytes == 0U) {
+        return false;
+    }
+
+    size_t track = drive->directory_offset / track_bytes;
+    size_t track_offset = drive->directory_offset % track_bytes;
+    size_t sector = track_offset / drive->geometry.sector_size;
+    size_t sector_offset = track_offset % drive->geometry.sector_size;
+
+    size_t copied = 0U;
+    while (copied < drive->directory_metadata_bytes) {
+        DiskStatus status = disk_cache_ensure(drive, track, sector);
+        if (status != DISK_STATUS_OK) {
+            return false;
+        }
+
+        size_t available = drive->geometry.sector_size - sector_offset;
+        size_t remaining = drive->directory_metadata_bytes - copied;
+        size_t take = (remaining < available) ? remaining : available;
+        memcpy(drive->directory_metadata + copied, drive->cache + sector_offset, take);
+        copied += take;
+        sector_offset = 0U;
+        ++sector;
+        if (sector >= drive->geometry.sectors_per_track) {
+            sector = 0U;
+            ++track;
+        }
+    }
+
+    if (!drive->allocation_vector_from_bios) {
+        disk_recompute_allocation_vector(drive);
+    }
+
+    return true;
+}
+
+static void disk_apply_write_to_metadata(DiskDrive *drive, size_t track, size_t sector, const uint8_t *buffer)
+{
+    if (drive == NULL || drive->directory_metadata == NULL || buffer == NULL) {
+        return;
+    }
+
+    size_t track_bytes = drive->geometry.sectors_per_track * drive->geometry.sector_size;
+    if (track_bytes == 0U) {
+        return;
+    }
+
+    size_t sector_size = drive->geometry.sector_size;
+    size_t sector_start = track * track_bytes + sector * sector_size;
+    size_t dir_start = drive->directory_offset;
+    size_t dir_end = drive->directory_offset + drive->directory_metadata_bytes;
+
+    if (dir_start >= sector_start + sector_size || dir_end <= sector_start) {
+        return;
+    }
+
+    size_t overlap_start = (sector_start > dir_start) ? sector_start : dir_start;
+    size_t overlap_end = (sector_start + sector_size < dir_end) ? (sector_start + sector_size) : dir_end;
+    if (overlap_end <= overlap_start) {
+        return;
+    }
+
+    size_t buffer_offset = overlap_start - sector_start;
+    size_t metadata_offset = overlap_start - dir_start;
+    size_t copy_bytes = overlap_end - overlap_start;
+
+    memcpy(drive->directory_metadata + metadata_offset, buffer + buffer_offset, copy_bytes);
+
+    if (!drive->allocation_vector_from_bios) {
+        disk_recompute_allocation_vector(drive);
+    }
 }
 
 static DiskStatus disk_read_uncached(DiskDrive *drive, size_t track, size_t sector, uint8_t *buffer)
@@ -284,7 +461,8 @@ static DiskStatus disk_cache_ensure(DiskDrive *drive, size_t track, size_t secto
         return DISK_STATUS_OK;
     }
 
-    DiskStatus status = disk_read_uncached(drive, track, sector, drive->cache);
+    size_t physical_sector = disk_map_logical_sector(drive, sector);
+    DiskStatus status = disk_read_uncached(drive, track, physical_sector, drive->cache);
     if (status != DISK_STATUS_OK) {
         return status;
     }
@@ -432,8 +610,68 @@ int disk_mount(DiskDrive *drive, const char *path, const DiskGeometry *geometry)
     drive->cache_valid = false;
     drive->cache_track = 0U;
     drive->cache_sector = 0U;
+    drive->translation_table = NULL;
+    drive->translation_table_entries = 0U;
+
+    if (geom.sectors_per_track > 0U) {
+        drive->translation_table = (uint8_t *)malloc(geom.sectors_per_track);
+        if (drive->translation_table == NULL) {
+            disk_unmount(drive);
+            return -1;
+        }
+        drive->translation_table_entries = geom.sectors_per_track;
+        for (size_t i = 0U; i < geom.sectors_per_track; ++i) {
+            drive->translation_table[i] = (uint8_t)i;
+        }
+
+        if (geom.translation_table_length > 0U) {
+            if (geom.translation_table == NULL || geom.translation_table_length != geom.sectors_per_track) {
+                disk_unmount(drive);
+                return -1;
+            }
+
+            for (size_t i = 0U; i < geom.translation_table_length; ++i) {
+                uint8_t value = geom.translation_table[i];
+                if (value >= geom.sectors_per_track) {
+                    disk_unmount(drive);
+                    return -1;
+                }
+                drive->translation_table[i] = value;
+            }
+        }
+    }
 
     disk_compute_metadata(drive);
+
+    drive->directory_metadata = NULL;
+    drive->allocation_vector_data = NULL;
+    drive->allocation_vector_from_bios = false;
+
+    if (drive->directory_metadata_bytes > 0U) {
+        drive->directory_metadata = (uint8_t *)malloc(drive->directory_metadata_bytes);
+        if (drive->directory_metadata == NULL) {
+            disk_unmount(drive);
+            return -1;
+        }
+    }
+
+    if (drive->allocation_vector_bytes > 0U) {
+        drive->allocation_vector_data = (uint8_t *)malloc(drive->allocation_vector_bytes);
+        if (drive->allocation_vector_data == NULL) {
+            disk_unmount(drive);
+            return -1;
+        }
+        memset(drive->allocation_vector_data, 0, drive->allocation_vector_bytes);
+    }
+
+    if (drive->directory_metadata != NULL) {
+        if (!disk_refresh_directory_metadata(drive)) {
+            disk_unmount(drive);
+            return -1;
+        }
+    } else if (drive->allocation_vector_data != NULL && !drive->allocation_vector_from_bios) {
+        memset(drive->allocation_vector_data, 0, drive->allocation_vector_bytes);
+    }
 
     return 0;
 }
@@ -461,7 +699,8 @@ DiskStatus disk_read_sector(DiskDrive *drive, size_t track, size_t sector, uint8
         return DISK_STATUS_OK;
     }
 
-    return disk_read_uncached(drive, track, sector, buffer);
+    size_t physical_sector = disk_map_logical_sector(drive, sector);
+    return disk_read_uncached(drive, track, physical_sector, buffer);
 }
 
 DiskStatus disk_write_sector(DiskDrive *drive, size_t track, size_t sector, const uint8_t *buffer, size_t length)
@@ -482,7 +721,8 @@ DiskStatus disk_write_sector(DiskDrive *drive, size_t track, size_t sector, cons
         return DISK_STATUS_IO_ERROR;
     }
 
-    DiskStatus status = disk_write_uncached(drive, track, sector, buffer);
+    size_t physical_sector = disk_map_logical_sector(drive, sector);
+    DiskStatus status = disk_write_uncached(drive, track, physical_sector, buffer);
     if (status != DISK_STATUS_OK) {
         return status;
     }
@@ -493,6 +733,8 @@ DiskStatus disk_write_sector(DiskDrive *drive, size_t track, size_t sector, cons
         drive->cache_track = track;
         drive->cache_sector = sector;
     }
+
+    disk_apply_write_to_metadata(drive, track, sector, buffer);
 
     return DISK_STATUS_OK;
 }
@@ -512,6 +754,12 @@ void disk_unmount(DiskDrive *drive)
         free(drive->cache);
         drive->cache = NULL;
     }
+
+    if (drive->translation_table != NULL) {
+        free(drive->translation_table);
+        drive->translation_table = NULL;
+    }
+    drive->translation_table_entries = 0U;
 
     memset(&drive->geometry, 0, sizeof(drive->geometry));
     drive->image_size = 0U;
@@ -550,6 +798,27 @@ size_t disk_allocation_vector_bytes(const DiskDrive *drive)
     return drive->allocation_vector_bytes;
 }
 
+const uint8_t *disk_allocation_vector(const DiskDrive *drive)
+{
+    if (drive == NULL) {
+        return NULL;
+    }
+    return drive->allocation_vector_data;
+}
+
+const uint8_t *disk_translation_table(const DiskDrive *drive, size_t *length)
+{
+    if (drive == NULL) {
+        return NULL;
+    }
+
+    if (length != NULL) {
+        *length = drive->translation_table_entries;
+    }
+
+    return drive->translation_table;
+}
+
 DiskStatus disk_read_directory_entry(DiskDrive *drive, size_t index, DiskDirectoryEntry *entry)
 {
     if (drive == NULL || entry == NULL || !drive->mounted) {
@@ -562,6 +831,14 @@ DiskStatus disk_read_directory_entry(DiskDrive *drive, size_t index, DiskDirecto
 
     if (index >= drive->directory_entries) {
         return DISK_STATUS_BAD_ADDRESS;
+    }
+
+    if (drive->directory_metadata != NULL) {
+        size_t offset = index * 32U;
+        if (offset + 32U <= drive->directory_metadata_bytes) {
+            disk_parse_directory_entry_bytes(&drive->directory_metadata[offset], entry);
+            return DISK_STATUS_OK;
+        }
     }
 
     size_t track_bytes = drive->geometry.sectors_per_track * drive->geometry.sector_size;
@@ -601,5 +878,30 @@ DiskStatus disk_read_directory_entry(DiskDrive *drive, size_t index, DiskDirecto
 
 void disk_invalidate_cache(DiskDrive *drive)
 {
+    if (drive == NULL) {
+        return;
+    }
+
     disk_invalidate_cache_internal(drive);
+}
+
+void disk_update_allocation_vector(DiskDrive *drive, const uint8_t *data, size_t length)
+{
+    if (drive == NULL || data == NULL) {
+        return;
+    }
+
+    if (drive->allocation_vector_bytes == 0U || length != drive->allocation_vector_bytes) {
+        return;
+    }
+
+    if (drive->allocation_vector_data == NULL) {
+        drive->allocation_vector_data = (uint8_t *)malloc(drive->allocation_vector_bytes);
+        if (drive->allocation_vector_data == NULL) {
+            return;
+        }
+    }
+
+    memcpy(drive->allocation_vector_data, data, drive->allocation_vector_bytes);
+    drive->allocation_vector_from_bios = true;
 }
