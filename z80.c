@@ -1,6 +1,7 @@
 #include <ctype.h>
 #include <errno.h>
 #include <inttypes.h>
+#include <limits.h>
 #include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -14,6 +15,7 @@
 #define CP_M_BIOS_ENTRY 0x0000U
 #define CP_M_BDOS_ENTRY 0x0005U
 #define CP_M_DEFAULT_DMA 0x0080U
+#define CP_M_RECORD_SIZE 128U
 #define CP_M_MAX_OPEN_FILES 16
 #define CP_M_MAX_DISK_DRIVES 16
 #define BIOS_TABLE_REGION_START 0xF000U
@@ -260,13 +262,73 @@ static void cpm_return_from_call(Emulator *emu)
     emu->cpu.pc = ret;
 }
 
+static uint32_t cpm_fcb_random_record_value(const Emulator *emu, uint16_t fcb_address)
+{
+    uint32_t value = memory_read8(emu, (uint16_t)(fcb_address + 33U));
+    value |= (uint32_t)memory_read8(emu, (uint16_t)(fcb_address + 34U)) << 8;
+    value |= (uint32_t)(memory_read8(emu, (uint16_t)(fcb_address + 35U)) & 0x7FU) << 16;
+    return value;
+}
+
+static void cpm_fcb_set_random_record_value(Emulator *emu, uint16_t fcb_address, uint32_t record)
+{
+    if (record > 0xFFFFFFU) {
+        record = 0xFFFFFFU;
+    }
+
+    memory_write8(emu, (uint16_t)(fcb_address + 33U), (uint8_t)(record & 0xFFU));
+    memory_write8(emu, (uint16_t)(fcb_address + 34U), (uint8_t)((record >> 8) & 0xFFU));
+    memory_write8(emu, (uint16_t)(fcb_address + 35U), (uint8_t)((record >> 16) & 0x7FU));
+}
+
+static void cpm_fcb_update_from_record(Emulator *emu, uint16_t fcb_address, uint32_t record)
+{
+    if (record > 0xFFFFFFU) {
+        record = 0xFFFFFFU;
+    }
+
+    uint32_t extent_index = record / CP_M_RECORD_SIZE;
+    uint8_t current_record = (uint8_t)(record % CP_M_RECORD_SIZE);
+    uint8_t extent_low = (uint8_t)(extent_index & 0x1FU);
+    uint8_t extent_high = (uint8_t)((extent_index >> 5) & 0xFFU);
+
+    uint8_t extent_byte = memory_read8(emu, (uint16_t)(fcb_address + 12U));
+    extent_byte = (uint8_t)((extent_byte & 0xE0U) | extent_low);
+    memory_write8(emu, (uint16_t)(fcb_address + 12U), extent_byte);
+    memory_write8(emu, (uint16_t)(fcb_address + 13U), 0x00U);
+    memory_write8(emu, (uint16_t)(fcb_address + 14U), extent_high);
+    memory_write8(emu, (uint16_t)(fcb_address + 32U), current_record);
+    cpm_fcb_set_random_record_value(emu, fcb_address, record);
+}
+
+static uint32_t cpm_fcb_record_from_extent(const Emulator *emu, uint16_t fcb_address)
+{
+    uint8_t extent = memory_read8(emu, (uint16_t)(fcb_address + 12U)) & 0x1FU;
+    uint8_t extent_high = memory_read8(emu, (uint16_t)(fcb_address + 14U));
+    uint8_t current_record = memory_read8(emu, (uint16_t)(fcb_address + 32U));
+
+    uint32_t extent_index = ((uint32_t)extent_high << 5) | extent;
+    return extent_index * CP_M_RECORD_SIZE + current_record;
+}
+
+static bool cpm_record_to_offset(uint32_t record, long *offset)
+{
+    if (offset == NULL) {
+        return false;
+    }
+
+    if (record > (uint32_t)(LONG_MAX / CP_M_RECORD_SIZE)) {
+        return false;
+    }
+
+    *offset = (long)(record * CP_M_RECORD_SIZE);
+    return true;
+}
+
 static void cpm_reset_fcb_position(Emulator *emu, uint16_t fcb_address)
 {
-    memory_write8(emu, (uint16_t)(fcb_address + 12U), 0U);
-    memory_write8(emu, (uint16_t)(fcb_address + 32U), 0U);
-    memory_write8(emu, (uint16_t)(fcb_address + 33U), 0U);
-    memory_write8(emu, (uint16_t)(fcb_address + 34U), 0U);
-    memory_write8(emu, (uint16_t)(fcb_address + 35U), 0U);
+    cpm_fcb_update_from_record(emu, fcb_address, 0U);
+    memory_write8(emu, (uint16_t)(fcb_address + 15U), 0U);
 }
 
 static bool cpm_parse_fcb_filename(const Emulator *emu, uint16_t fcb_address, char *buffer, size_t size)
@@ -536,19 +598,6 @@ static bool bios_initialise_drive_tables(Emulator *emu)
     return true;
 }
 
-static void cpm_advance_record(Emulator *emu, uint16_t fcb_address)
-{
-    uint8_t current = memory_read8(emu, (uint16_t)(fcb_address + 32U));
-    current = (uint8_t)(current + 1U);
-    memory_write8(emu, (uint16_t)(fcb_address + 32U), current);
-
-    if (current == 0U) {
-        uint8_t extend = memory_read8(emu, (uint16_t)(fcb_address + 12U));
-        extend = (uint8_t)(extend + 1U);
-        memory_write8(emu, (uint16_t)(fcb_address + 12U), extend);
-    }
-}
-
 static uint8_t cpm_bdos_open_file(Emulator *emu, uint16_t fcb_address)
 {
     char filename[32];
@@ -653,20 +702,32 @@ static uint8_t cpm_bdos_read_sequential(Emulator *emu, uint16_t fcb_address)
         return 0xFFU;
     }
 
-    uint8_t buffer[128];
-    size_t read = fread(buffer, 1U, sizeof(buffer), handle->fp);
+    uint32_t record = cpm_fcb_random_record_value(emu, fcb_address);
+    long offset;
+    if (!cpm_record_to_offset(record, &offset)) {
+        return 0xFFU;
+    }
+
+    if (fseek(handle->fp, offset, SEEK_SET) != 0) {
+        return 0xFFU;
+    }
+
+    uint8_t buffer[CP_M_RECORD_SIZE];
+    size_t read = fread(buffer, 1U, CP_M_RECORD_SIZE, handle->fp);
     if (read == 0U) {
+        memory_write8(emu, (uint16_t)(fcb_address + 15U), 0U);
         return 0x01U;
     }
 
     for (size_t i = 0; i < read; ++i) {
-        memory_write8(emu, (uint16_t)(emu->dma_address + i), buffer[i]);
+        memory_write8(emu, (uint16_t)(emu->dma_address + (uint16_t)i), buffer[i]);
     }
-    for (size_t i = read; i < sizeof(buffer); ++i) {
-        memory_write8(emu, (uint16_t)(emu->dma_address + i), 0x1AU);
+    for (size_t i = read; i < CP_M_RECORD_SIZE; ++i) {
+        memory_write8(emu, (uint16_t)(emu->dma_address + (uint16_t)i), 0x1AU);
     }
 
-    cpm_advance_record(emu, fcb_address);
+    cpm_fcb_update_from_record(emu, fcb_address, record + 1U);
+    memory_write8(emu, (uint16_t)(fcb_address + 15U), (uint8_t)read);
 
     return 0x00U;
 }
@@ -678,19 +739,171 @@ static uint8_t cpm_bdos_write_sequential(Emulator *emu, uint16_t fcb_address)
         return 0xFFU;
     }
 
-    uint8_t buffer[128];
-    for (size_t i = 0; i < sizeof(buffer); ++i) {
-        buffer[i] = memory_read8(emu, (uint16_t)(emu->dma_address + i));
+    uint32_t record = cpm_fcb_random_record_value(emu, fcb_address);
+    long offset;
+    if (!cpm_record_to_offset(record, &offset)) {
+        return 0xFFU;
     }
 
-    size_t written = fwrite(buffer, 1U, sizeof(buffer), handle->fp);
-    if (written != sizeof(buffer)) {
+    if (fseek(handle->fp, offset, SEEK_SET) != 0) {
+        return 0xFFU;
+    }
+
+    uint8_t buffer[CP_M_RECORD_SIZE];
+    for (size_t i = 0; i < CP_M_RECORD_SIZE; ++i) {
+        buffer[i] = memory_read8(emu, (uint16_t)(emu->dma_address + (uint16_t)i));
+    }
+
+    size_t written = fwrite(buffer, 1U, CP_M_RECORD_SIZE, handle->fp);
+    if (written != CP_M_RECORD_SIZE) {
         return 0x01U;
     }
 
-    fflush(handle->fp);
-    cpm_advance_record(emu, fcb_address);
+    if (fflush(handle->fp) != 0) {
+        return 0x01U;
+    }
+
+    cpm_fcb_update_from_record(emu, fcb_address, record + 1U);
+    memory_write8(emu, (uint16_t)(fcb_address + 15U), (uint8_t)CP_M_RECORD_SIZE);
     return 0x00U;
+}
+
+static uint8_t cpm_bdos_read_random(Emulator *emu, uint16_t fcb_address)
+{
+    CpmFileHandle *handle = cpm_find_file(emu, fcb_address);
+    if (handle == NULL || handle->fp == NULL) {
+        return 0xFFU;
+    }
+
+    uint32_t record = cpm_fcb_random_record_value(emu, fcb_address);
+    long offset;
+    if (!cpm_record_to_offset(record, &offset)) {
+        return 0xFFU;
+    }
+
+    if (fseek(handle->fp, offset, SEEK_SET) != 0) {
+        return 0xFFU;
+    }
+
+    uint8_t buffer[CP_M_RECORD_SIZE];
+    size_t read = fread(buffer, 1U, CP_M_RECORD_SIZE, handle->fp);
+    if (read == 0U) {
+        memory_write8(emu, (uint16_t)(fcb_address + 15U), 0U);
+        return 0x01U;
+    }
+
+    for (size_t i = 0; i < read; ++i) {
+        memory_write8(emu, (uint16_t)(emu->dma_address + (uint16_t)i), buffer[i]);
+    }
+    for (size_t i = read; i < CP_M_RECORD_SIZE; ++i) {
+        memory_write8(emu, (uint16_t)(emu->dma_address + (uint16_t)i), 0x1AU);
+    }
+
+    cpm_fcb_update_from_record(emu, fcb_address, record + 1U);
+    memory_write8(emu, (uint16_t)(fcb_address + 15U), (uint8_t)read);
+    return 0x00U;
+}
+
+static uint8_t cpm_bdos_write_random(Emulator *emu, uint16_t fcb_address)
+{
+    CpmFileHandle *handle = cpm_find_file(emu, fcb_address);
+    if (handle == NULL || handle->fp == NULL || handle->read_only) {
+        return 0xFFU;
+    }
+
+    uint32_t record = cpm_fcb_random_record_value(emu, fcb_address);
+    long offset;
+    if (!cpm_record_to_offset(record, &offset)) {
+        return 0xFFU;
+    }
+
+    if (fseek(handle->fp, offset, SEEK_SET) != 0) {
+        return 0xFFU;
+    }
+
+    uint8_t buffer[CP_M_RECORD_SIZE];
+    for (size_t i = 0; i < CP_M_RECORD_SIZE; ++i) {
+        buffer[i] = memory_read8(emu, (uint16_t)(emu->dma_address + (uint16_t)i));
+    }
+
+    size_t written = fwrite(buffer, 1U, CP_M_RECORD_SIZE, handle->fp);
+    if (written != CP_M_RECORD_SIZE) {
+        return 0x01U;
+    }
+
+    if (fflush(handle->fp) != 0) {
+        return 0x01U;
+    }
+
+    cpm_fcb_update_from_record(emu, fcb_address, record + 1U);
+    memory_write8(emu, (uint16_t)(fcb_address + 15U), (uint8_t)CP_M_RECORD_SIZE);
+    return 0x00U;
+}
+
+static uint8_t cpm_bdos_compute_file_size(Emulator *emu, uint16_t fcb_address)
+{
+    CpmFileHandle *handle = cpm_find_file(emu, fcb_address);
+    if (handle == NULL || handle->fp == NULL) {
+        return 0xFFU;
+    }
+
+    long current = ftell(handle->fp);
+    if (current < 0L) {
+        current = 0L;
+    }
+
+    if (fseek(handle->fp, 0L, SEEK_END) != 0) {
+        return 0xFFU;
+    }
+
+    long end = ftell(handle->fp);
+    if (end < 0L) {
+        (void)fseek(handle->fp, current, SEEK_SET);
+        return 0xFFU;
+    }
+
+    if (fseek(handle->fp, current, SEEK_SET) != 0) {
+        return 0xFFU;
+    }
+
+    uint32_t records = (uint32_t)(end / (long)CP_M_RECORD_SIZE);
+    uint8_t remainder = (uint8_t)(end % (long)CP_M_RECORD_SIZE);
+    if ((end % (long)CP_M_RECORD_SIZE) != 0L) {
+        ++records;
+    }
+
+    cpm_fcb_update_from_record(emu, fcb_address, records);
+    memory_write8(emu, (uint16_t)(fcb_address + 15U), remainder);
+    return 0x00U;
+}
+
+static uint8_t cpm_bdos_set_random_record(Emulator *emu, uint16_t fcb_address)
+{
+    uint32_t record = cpm_fcb_record_from_extent(emu, fcb_address);
+    cpm_fcb_update_from_record(emu, fcb_address, record);
+    return 0x00U;
+}
+
+static uint16_t cpm_bdos_login_vector(const Emulator *emu)
+{
+    uint16_t mask = 0U;
+    for (size_t i = 0U; i < CP_M_MAX_DISK_DRIVES && i < 16U; ++i) {
+        if (disk_is_mounted(&emu->disks[i])) {
+            mask |= (uint16_t)(1U << i);
+        }
+    }
+    return mask;
+}
+
+static uint16_t cpm_bdos_read_only_vector(const Emulator *emu)
+{
+    uint16_t mask = 0U;
+    for (size_t i = 0U; i < CP_M_MAX_DISK_DRIVES && i < 16U; ++i) {
+        if (disk_is_mounted(&emu->disks[i]) && emu->disks[i].read_only) {
+            mask |= (uint16_t)(1U << i);
+        }
+    }
+    return mask;
 }
 
 static uint8_t cpm_bdos_rename_file(Emulator *emu, uint16_t fcb_address)
@@ -1122,8 +1335,35 @@ static int handle_bdos_call(Emulator *emu)
     case 0x17:
         return_code = cpm_bdos_rename_file(emu, de);
         break;
+    case 0x18: {
+        uint16_t mask = cpm_bdos_login_vector(emu);
+        z80_set_hl(&emu->cpu, mask);
+        return_code = (uint8_t)(mask & 0xFFU);
+        break;
+    }
+    case 0x19:
+        return_code = emu->default_drive;
+        break;
     case 0x1A:
         return_code = cpm_bdos_set_dma(emu, de);
+        break;
+    case 0x1D: {
+        uint16_t mask = cpm_bdos_read_only_vector(emu);
+        z80_set_hl(&emu->cpu, mask);
+        return_code = (uint8_t)(mask & 0xFFU);
+        break;
+    }
+    case 0x21:
+        return_code = cpm_bdos_read_random(emu, de);
+        break;
+    case 0x22:
+        return_code = cpm_bdos_write_random(emu, de);
+        break;
+    case 0x23:
+        return_code = cpm_bdos_compute_file_size(emu, de);
+        break;
+    case 0x24:
+        return_code = cpm_bdos_set_random_record(emu, de);
         break;
     default:
         return_code = 0xFFU;

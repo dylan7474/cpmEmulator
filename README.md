@@ -9,7 +9,7 @@ The current state includes:
 - A flat 64 KiB memory map suitable for early CP/M programs.
 - A configurable disk subsystem with multi-drive support wired into BIOS trap handlers. Each mounted image tracks per-drive geometry, exposes CP/M-compatible drive tables, sector translation tables, and disk parameter headers for `SELDSK`, caches recently accessed sectors, persists allocation vector updates alongside directory metadata, and reports detailed status codes so CP/M filesystem routines can react to I/O faults while the full FDC emulation evolves.
 - CP/M-style BIOS warm boot and BDOS entry points that translate console and file calls into host operations so simple programs can interact with the environment.
-- BDOS trampolines covering sequential file I/O as well as directory search helpers (`SEARCH FIRST`/`SEARCH NEXT`) so console utilities can enumerate the mounted disk images without custom host shims.
+- BDOS trampolines covering sequential and random record file I/O alongside directory search helpers (`SEARCH FIRST`/`SEARCH NEXT`) so console utilities can enumerate the mounted disk images without custom host shims while remaining compatible with extent sequencing.
 
 Expect to extend the instruction coverage and peripheral behaviour as CP/M functionality is implemented.
 
@@ -59,13 +59,13 @@ When one or more disk images are mounted, the emulator reserves a BIOS workspace
 
 ## Testing
 
-Run the regression suite to ensure the CP/M system exercise and sample transient program both still behave:
+Run the regression suite to ensure the CP/M system exercise and sample transient program both still behave, and that disk shims continue to match CP/M conventions:
 
 ```
 make test
 ```
 
-The harness first invokes a Python integration test that assembles `examples/hello.asm` on the fly, runs the resulting binary under the emulator, and asserts on the captured console output so the recent `ED`-prefixed flag fixes stay covered. It then boots a curated CP/M 2.2 supervisor image with the emulator running in "no traps" mode. Successful runs show the `Hello from CP/M!` greeting, demonstrating that the command console trampolines are still wired correctly and that the expanded Z80 `ED` and IX/IY-prefixed helpers behave as expected in both a transient program and the supervisor stack itself.
+The harness first invokes a Python integration test that assembles `examples/hello.asm` on the fly, runs the resulting binary under the emulator, and asserts on the captured console output so the recent `ED`-prefixed flag fixes stay covered. It then assembles a transient program that exercises the BDOS random read/write helpers against a host-backed file, confirming that extent sequencing and random record updates stay synchronised with the new helpers. A companion regression compiles a small C harness that mounts a deliberately skewed disk image via the `disk.c` API to verify that directory enumeration continues to respect CP/M translation tables. After those targeted checks, the suite boots a curated CP/M 2.2 supervisor image with the emulator running in "no traps" mode. Successful runs show the `Hello from CP/M!` greeting, demonstrating that the command console trampolines are still wired correctly and that the expanded Z80 `ED` and IX/IY-prefixed helpers behave as expected in both a transient program and the supervisor stack itself.
 
 After validating the supervisor image, the regression mounts a generated single-track diskette and runs `examples/bios_disk.bin`. That transient program issues BIOS `SELDSK`, `SETTRK`, `SETSEC`, `SETDMA`, and `READ` calls, confirming that the host-side FDC abstraction can service sector reads through the CP/M BIOS entry point. The BIOS shims now surface explicit `DISK_STATUS_*` return codes, so the program can distinguish "not ready" from "bad address" failures while echoing the sector payload through BDOS function 9.
 
@@ -90,8 +90,8 @@ Because most peripheral behaviours and a handful of less common opcodes are stil
 To validate the IX/IY-prefixed instruction paths against real system software, the test suite stores base64-encoded CP/M 2.2 supervisor images sourced from the [z80pack](https://github.com/udo-munk/z80pack) reconstruction. The helper script invoked by `make test` decodes the CCP/BDOS bundle (`cpm.bin.base64`) and BIOS stub (`bios.bin.base64`) into temporary binaries, maps them at `0xDC00` and `0xFA00`, disables the host BDOS/BIOS shims, and executes the machine for 500,000 T-states. When the emulator completes without reporting unimplemented opcodes, the IX/IY-prefixed execution paths have been exercised against the full CP/M supervisor stack. Mount a disk image with `--disk A:path` to extend the experiment to filesystem and console integration as new device emulation features land.
 
 ## Next steps
-- Implement BDOS random record read/write helpers so programs that rely on extent sequencing can share disk images with the host-backed file API.
-- Add regression coverage for skewed disk layouts by mounting an image that uses a non-trivial translation table and verifying directory enumeration still matches CP/M expectations.
-- Surface disk write-protect status to BDOS callers so utilities can distinguish between read-only media and I/O failures.
+- Integrate BDOS attribute helpers so host read-only flags flow through to directory entries and allocation maps.
+- Expand console device handling to cover the punch/list streams in addition to the primary console hooks.
+- Teach the disk mounter to infer sensible defaults from image headers when explicit geometry is omitted on the command line.
 
 Contributions that expand opcode coverage, improve testing, or add CP/M-compatible peripherals are welcome.
