@@ -8,6 +8,7 @@
 #define EXPECTED_SECTOR_SIZE 256U
 #define EXPECTED_SECTORS_PER_TRACK 32U
 #define EXPECTED_TRACKS 4U
+#define EXPECTED_DIRBUF 512U
 
 static bool verify_pattern(const uint8_t *buffer, size_t length)
 {
@@ -66,6 +67,12 @@ int main(int argc, char **argv)
 
     if (drive.has_default_dma) {
         fprintf(stderr, "unexpected default DMA value: 0x%04X\n", drive.default_dma_address);
+        ok = false;
+    }
+
+    if (!drive.has_directory_buffer || drive.directory_buffer_bytes != EXPECTED_DIRBUF) {
+        fprintf(stderr, "directory buffer mismatch: has=%d size=%zu\n",
+                drive.has_directory_buffer ? 1 : 0, drive.directory_buffer_bytes);
         ok = false;
     }
 

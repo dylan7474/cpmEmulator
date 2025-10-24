@@ -55,6 +55,10 @@ typedef struct {
 typedef struct {
     bool in_use;
     bool read_only;
+    bool host_read_only;
+    bool read_only_attribute;
+    bool system_attribute;
+    bool archive_attribute;
     uint16_t fcb_address;
     FILE *fp;
 } CpmFileHandle;
@@ -85,6 +89,10 @@ typedef struct {
     DirectorySearchState directory_search;
     FILE *reader_fp;
     bool reader_close;
+    FILE *punch_fp;
+    bool punch_close;
+    FILE *list_fp;
+    bool list_close;
 } Emulator;
 
 static inline uint16_t z80_bc(const Z80 *cpu)
@@ -411,12 +419,39 @@ static CpmFileHandle *cpm_allocate_file(Emulator *emu, uint16_t fcb_address)
             emu->files[i].in_use = true;
             emu->files[i].fcb_address = fcb_address;
             emu->files[i].read_only = false;
+            emu->files[i].host_read_only = false;
+            emu->files[i].read_only_attribute = false;
+            emu->files[i].system_attribute = false;
+            emu->files[i].archive_attribute = false;
             emu->files[i].fp = NULL;
             return &emu->files[i];
         }
     }
 
     return NULL;
+}
+
+static void cpm_handle_update_permissions(CpmFileHandle *handle)
+{
+    if (handle == NULL) {
+        return;
+    }
+
+    handle->read_only = handle->host_read_only || handle->read_only_attribute || handle->system_attribute
+                         || handle->archive_attribute;
+}
+
+static void cpm_handle_sync_from_fcb(Emulator *emu, CpmFileHandle *handle)
+{
+    if (emu == NULL || handle == NULL || !handle->in_use) {
+        return;
+    }
+
+    uint16_t fcb = handle->fcb_address;
+    handle->read_only_attribute = (memory_read8(emu, (uint16_t)(fcb + 9U)) & 0x80U) != 0U;
+    handle->system_attribute = (memory_read8(emu, (uint16_t)(fcb + 10U)) & 0x80U) != 0U;
+    handle->archive_attribute = (memory_read8(emu, (uint16_t)(fcb + 11U)) & 0x80U) != 0U;
+    cpm_handle_update_permissions(handle);
 }
 
 static void cpm_release_file(CpmFileHandle *handle)
@@ -432,6 +467,10 @@ static void cpm_release_file(CpmFileHandle *handle)
 
     handle->in_use = false;
     handle->read_only = false;
+    handle->host_read_only = false;
+    handle->read_only_attribute = false;
+    handle->system_attribute = false;
+    handle->archive_attribute = false;
     handle->fcb_address = 0U;
 }
 
@@ -445,6 +484,10 @@ static void cpm_close_all_files(Emulator *emu)
             }
             emu->files[i].in_use = false;
             emu->files[i].read_only = false;
+            emu->files[i].host_read_only = false;
+            emu->files[i].read_only_attribute = false;
+            emu->files[i].system_attribute = false;
+            emu->files[i].archive_attribute = false;
             emu->files[i].fcb_address = 0U;
         }
     }
@@ -536,6 +579,9 @@ static bool bios_initialise_drive_tables(Emulator *emu)
                 }
 
                 size_t dirbuf_bytes = BIOS_DIRBUF_BYTES;
+                if (drive->has_directory_buffer && drive->directory_buffer_bytes > 0U) {
+                    dirbuf_bytes = drive->directory_buffer_bytes;
+                }
                 if (drive->geometry.sector_size > dirbuf_bytes) {
                     dirbuf_bytes = drive->geometry.sector_size;
                 }
@@ -636,6 +682,11 @@ static uint8_t cpm_bdos_open_file(Emulator *emu, uint16_t fcb_address)
         handle->fp = NULL;
     }
 
+    handle->host_read_only = false;
+    handle->read_only_attribute = false;
+    handle->system_attribute = false;
+    handle->archive_attribute = false;
+
     FILE *fp = fopen(filename, "r+b");
     if (fp == NULL) {
         fp = fopen(filename, "rb");
@@ -644,12 +695,13 @@ static uint8_t cpm_bdos_open_file(Emulator *emu, uint16_t fcb_address)
             handle->fcb_address = 0U;
             return 0xFFU;
         }
-        handle->read_only = true;
+        handle->host_read_only = true;
     } else {
-        handle->read_only = false;
+        handle->host_read_only = false;
     }
 
     handle->fp = fp;
+    cpm_handle_sync_from_fcb(emu, handle);
     cpm_reset_fcb_position(emu, fcb_address);
     (void)fseek(fp, 0L, SEEK_SET);
     return 0x00U;
@@ -667,6 +719,10 @@ static uint8_t cpm_bdos_close_file(Emulator *emu, uint16_t fcb_address)
     handle->fp = NULL;
     handle->in_use = false;
     handle->read_only = false;
+    handle->host_read_only = false;
+    handle->read_only_attribute = false;
+    handle->system_attribute = false;
+    handle->archive_attribute = false;
     handle->fcb_address = 0U;
     return 0x00U;
 }
@@ -696,7 +752,11 @@ static uint8_t cpm_bdos_make_file(Emulator *emu, uint16_t fcb_address)
     }
 
     handle->fp = fp;
-    handle->read_only = false;
+    handle->host_read_only = false;
+    handle->read_only_attribute = false;
+    handle->system_attribute = false;
+    handle->archive_attribute = false;
+    cpm_handle_update_permissions(handle);
     cpm_reset_fcb_position(emu, fcb_address);
     return 0x00U;
 }
@@ -1049,6 +1109,10 @@ static uint8_t cpm_bdos_set_file_attributes(Emulator *emu, uint16_t fcb_address)
     memory_write8(emu, (uint16_t)(fcb_address + 11U), updated_archive);
 
     cpm_reset_directory_search(emu);
+    CpmFileHandle *handle = cpm_find_file(emu, fcb_address);
+    if (handle != NULL) {
+        cpm_handle_sync_from_fcb(emu, handle);
+    }
     return 0x00U;
 }
 
@@ -1259,16 +1323,18 @@ static uint8_t cpm_bdos_reader_input(Emulator *emu)
     return (uint8_t)ch;
 }
 
-static void cpm_bdos_output_punch(uint8_t value)
+static void cpm_bdos_output_punch(Emulator *emu, uint8_t value)
 {
-    fputc((int)value, stdout);
-    fflush(stdout);
+    FILE *stream = (emu != NULL && emu->punch_fp != NULL) ? emu->punch_fp : stdout;
+    fputc((int)value, stream);
+    fflush(stream);
 }
 
-static void cpm_bdos_output_list(uint8_t value)
+static void cpm_bdos_output_list(Emulator *emu, uint8_t value)
 {
-    fputc((int)value, stderr);
-    fflush(stderr);
+    FILE *stream = (emu != NULL && emu->list_fp != NULL) ? emu->list_fp : stderr;
+    fputc((int)value, stream);
+    fflush(stream);
 }
 
 static uint8_t cpm_bios_select_disk(Emulator *emu, uint8_t disk)
@@ -1447,11 +1513,11 @@ static int handle_bdos_call(Emulator *emu)
         return_code = emu->cpu.e;
         break;
     case 0x04:
-        cpm_bdos_output_punch(emu->cpu.e);
+        cpm_bdos_output_punch(emu, emu->cpu.e);
         return_code = emu->cpu.e;
         break;
     case 0x05:
-        cpm_bdos_output_list(emu->cpu.e);
+        cpm_bdos_output_list(emu, emu->cpu.e);
         return_code = emu->cpu.e;
         break;
     case 0x06:
@@ -3793,6 +3859,10 @@ static void emulator_init(Emulator *emu)
     cpm_reset_directory_search(emu);
     emu->reader_fp = NULL;
     emu->reader_close = false;
+    emu->punch_fp = NULL;
+    emu->punch_close = false;
+    emu->list_fp = NULL;
+    emu->list_close = false;
 }
 
 static void emulator_unmount_disks(Emulator *emu)
@@ -3812,6 +3882,16 @@ static void emulator_unmount_disks(Emulator *emu)
     }
     emu->reader_fp = NULL;
     emu->reader_close = false;
+    if (emu->punch_fp != NULL && emu->punch_close) {
+        fclose(emu->punch_fp);
+    }
+    emu->punch_fp = NULL;
+    emu->punch_close = false;
+    if (emu->list_fp != NULL && emu->list_close) {
+        fclose(emu->list_fp);
+    }
+    emu->list_fp = NULL;
+    emu->list_close = false;
 }
 
 static int hex_value(char ch)
@@ -4032,6 +4112,7 @@ static void usage(const char *prog)
     fprintf(stderr,
             "Usage: %s [--cycles N] [--disk DRIVE:path] [--disk-geom DRIVE:spt:ssize[:tracks]]\n"
             "           [--disk-xlt DRIVE:map] [--disk-a path] [--reader path]\n"
+            "           [--punch-out path] [--list-out path]\n"
             "           [--load addr:file] [--load-hex path] [--entry addr]\n"
             "           [--no-cpm-traps] [program.bin]\n",
             prog);
@@ -4135,6 +4216,8 @@ static bool parse_disk_geometry_spec(const char *spec, int *drive_index, DiskGeo
     geometry->default_dma_address = 0U;
     geometry->has_default_dma = false;
     geometry->allow_header = false;
+    geometry->directory_buffer_bytes = 0U;
+    geometry->has_directory_buffer = false;
 
     size_t len = strlen(spec);
     if (len == 0U || len >= 128U) {
@@ -4311,6 +4394,8 @@ int main(int argc, char **argv)
         disk_geometries[i].has_default_dma = false;
         disk_geometries[i].translation_table_owned = false;
         disk_geometries[i].allow_header = true;
+        disk_geometries[i].directory_buffer_bytes = 0U;
+        disk_geometries[i].has_directory_buffer = false;
         disk_translation_tables[i] = NULL;
         disk_translation_lengths[i] = 0U;
     }
@@ -4386,6 +4471,52 @@ int main(int argc, char **argv)
                 }
                 emu.reader_fp = reader;
                 emu.reader_close = true;
+            }
+        } else if (strcmp(argv[i], "--punch-out") == 0) {
+            if (i + 1 >= argc) {
+                usage(argv[0]);
+                return EXIT_FAILURE;
+            }
+            const char *path = argv[++i];
+            if (emu.punch_fp != NULL && emu.punch_close) {
+                fclose(emu.punch_fp);
+                emu.punch_fp = NULL;
+                emu.punch_close = false;
+            }
+            if (strcmp(path, "-") == 0) {
+                emu.punch_fp = NULL;
+                emu.punch_close = false;
+            } else {
+                FILE *punch = fopen(path, "wb");
+                if (punch == NULL) {
+                    fprintf(stderr, "Failed to open punch output '%s': %s\n", path, strerror(errno));
+                    return EXIT_FAILURE;
+                }
+                emu.punch_fp = punch;
+                emu.punch_close = true;
+            }
+        } else if (strcmp(argv[i], "--list-out") == 0) {
+            if (i + 1 >= argc) {
+                usage(argv[0]);
+                return EXIT_FAILURE;
+            }
+            const char *path = argv[++i];
+            if (emu.list_fp != NULL && emu.list_close) {
+                fclose(emu.list_fp);
+                emu.list_fp = NULL;
+                emu.list_close = false;
+            }
+            if (strcmp(path, "-") == 0) {
+                emu.list_fp = NULL;
+                emu.list_close = false;
+            } else {
+                FILE *list = fopen(path, "wb");
+                if (list == NULL) {
+                    fprintf(stderr, "Failed to open list output '%s': %s\n", path, strerror(errno));
+                    return EXIT_FAILURE;
+                }
+                emu.list_fp = list;
+                emu.list_close = true;
             }
         } else if (strncmp(argv[i], "--disk-", 7) == 0 && argv[i][7] != '\0' && argv[i][8] == '\0') {
             int drive_index = parse_drive_letter_char(argv[i][7]);

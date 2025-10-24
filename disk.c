@@ -9,6 +9,7 @@
 #define DISK_HEADER_SIZE 16U
 #define DISK_HEADER_FLAG_TRANSLATION 0x80000000U
 #define DISK_HEADER_FLAG_DEFAULT_DMA 0x40000000U
+#define DISK_HEADER_FLAG_DIRBUF 0x20000000U
 
 static DiskStatus disk_cache_ensure(DiskDrive *drive, size_t track, size_t sector);
 static void disk_parse_directory_entry_bytes(const uint8_t raw[32], DiskDirectoryEntry *entry);
@@ -53,7 +54,8 @@ static bool disk_try_apply_header(FILE *fp, DiskGeometry *geom, size_t file_size
 
     bool header_has_translation = (track_count_raw & DISK_HEADER_FLAG_TRANSLATION) != 0U;
     bool header_has_default_dma = (track_count_raw & DISK_HEADER_FLAG_DEFAULT_DMA) != 0U;
-    track_count_raw &= ~(DISK_HEADER_FLAG_TRANSLATION | DISK_HEADER_FLAG_DEFAULT_DMA);
+    bool header_has_dirbuf = (track_count_raw & DISK_HEADER_FLAG_DIRBUF) != 0U;
+    track_count_raw &= ~(DISK_HEADER_FLAG_TRANSLATION | DISK_HEADER_FLAG_DEFAULT_DMA | DISK_HEADER_FLAG_DIRBUF);
 
     if (sector_size == 0U || sectors_per_track == 0U) {
         (void)fseek(fp, original, SEEK_SET);
@@ -70,6 +72,8 @@ static bool disk_try_apply_header(FILE *fp, DiskGeometry *geom, size_t file_size
 
     bool original_has_default_dma = geom->has_default_dma;
     uint16_t original_default_dma = geom->default_dma_address;
+    bool original_has_dirbuf = geom->has_directory_buffer;
+    size_t original_dirbuf = geom->directory_buffer_bytes;
 
     if (header_has_default_dma) {
         if (file_size < offset + 2U) {
@@ -143,6 +147,22 @@ static bool disk_try_apply_header(FILE *fp, DiskGeometry *geom, size_t file_size
         }
     }
 
+    if (header_has_dirbuf) {
+        if (file_size < offset + 2U) {
+            goto fail;
+        }
+
+        uint8_t dirbuf_bytes[2];
+        if (fread(dirbuf_bytes, 1U, sizeof(dirbuf_bytes), fp) != sizeof(dirbuf_bytes)) {
+            goto fail;
+        }
+
+        size_t dirbuf = (size_t)((uint16_t)dirbuf_bytes[0] | ((uint16_t)dirbuf_bytes[1] << 8));
+        geom->directory_buffer_bytes = dirbuf;
+        geom->has_directory_buffer = true;
+        offset += sizeof(dirbuf_bytes);
+    }
+
     *data_offset = offset;
 
     if (fseek(fp, (long)*data_offset, SEEK_SET) != 0) {
@@ -161,6 +181,8 @@ fail:
 
     geom->default_dma_address = original_default_dma;
     geom->has_default_dma = original_has_default_dma;
+    geom->directory_buffer_bytes = original_dirbuf;
+    geom->has_directory_buffer = original_has_dirbuf;
 
     (void)fseek(fp, original, SEEK_SET);
     return false;
@@ -819,6 +841,8 @@ int disk_mount(DiskDrive *drive, const char *path, const DiskGeometry *geometry)
     drive->default_dma_address = geom.has_default_dma ? geom.default_dma_address : 0U;
     drive->has_default_dma = geom.has_default_dma;
     drive->data_offset = data_offset;
+    drive->directory_buffer_bytes = geom.has_directory_buffer ? geom.directory_buffer_bytes : 0U;
+    drive->has_directory_buffer = geom.has_directory_buffer;
     drive->cache = cache;
     drive->cache_valid = false;
     drive->cache_track = 0U;
@@ -1007,6 +1031,8 @@ void disk_unmount(DiskDrive *drive)
     drive->default_dma_address = 0U;
     drive->has_default_dma = false;
     drive->data_offset = 0U;
+    drive->directory_buffer_bytes = 0U;
+    drive->has_directory_buffer = false;
     disk_reset_metadata(drive);
     disk_invalidate_cache_internal(drive);
 }

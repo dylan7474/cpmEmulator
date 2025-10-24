@@ -438,6 +438,69 @@ class ReaderDeviceTest(unittest.TestCase):
         self.assertIn("TAPE!", result.stdout)
 
 
+class PunchListDeviceTest(unittest.TestCase):
+    def test_punch_and_list_streams_are_captured(self) -> None:
+        _build_emulator()
+
+        punch_bytes = [ord(ch) for ch in "PUNCH"]
+        list_bytes = [ord(ch) for ch in "LIST"]
+
+        assembly_lines = ["org 0x0100", "start:"]
+        for value in punch_bytes:
+            assembly_lines.extend(
+                [
+                    f"    mvi e, 0x{value:02X}",
+                    "    mvi c, 0x04",
+                    "    call 0x0005",
+                ]
+            )
+        for value in list_bytes:
+            assembly_lines.extend(
+                [
+                    f"    mvi e, 0x{value:02X}",
+                    "    mvi c, 0x05",
+                    "    call 0x0005",
+                ]
+            )
+        assembly_lines.extend(
+            [
+                "    mvi c, 0x00",
+                "    call 0x0005",
+            ]
+        )
+
+        program_bytes = assemble_source_lines(assembly_lines)
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            binary_path = Path(tmpdir) / "devices.bin"
+            binary_path.write_bytes(program_bytes)
+            punch_path = Path(tmpdir) / "punch.dat"
+            list_path = Path(tmpdir) / "list.dat"
+
+            result = subprocess.run(
+                [
+                    str(REPO_ROOT / "z80"),
+                    "--punch-out",
+                    str(punch_path),
+                    "--list-out",
+                    str(list_path),
+                    str(binary_path),
+                ],
+                cwd=REPO_ROOT,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                check=False,
+            )
+
+            punch_data = punch_path.read_bytes()
+            list_data = list_path.read_bytes()
+
+        self.assertEqual(result.returncode, 0, msg=f"Punch/list regression failed:\n{result.stdout}")
+        self.assertEqual(punch_data, bytes(punch_bytes))
+        self.assertEqual(list_data, bytes(list_bytes))
+
+
 class FileAttributeTest(unittest.TestCase):
     def test_system_and_archive_bits_are_persisted(self) -> None:
         _build_emulator()
@@ -567,12 +630,14 @@ class DiskHeaderInferenceTest(unittest.TestCase):
         sector_size = 256
         sectors_per_track = 32
         track_count = 4
+        dirbuf_size = 512
 
         header = bytearray()
         header.extend(b"CPMI")
         header.extend(struct.pack("<I", sector_size))
         header.extend(struct.pack("<I", sectors_per_track))
-        header.extend(struct.pack("<I", track_count))
+        header.extend(struct.pack("<I", track_count | 0x20000000))
+        header.extend(struct.pack("<H", dirbuf_size))
 
         data = bytearray(sector_size * sectors_per_track * track_count)
         data[:sector_size] = bytes(range(sector_size))
@@ -615,13 +680,15 @@ class DiskHeaderDmaIntegrationTest(unittest.TestCase):
         sectors_per_track = 26
         track_count = 2
         default_dma = 0x0200
+        dirbuf_size = 256
 
         header = bytearray()
         header.extend(b"CPMI")
         header.extend(struct.pack("<I", sector_size))
         header.extend(struct.pack("<I", sectors_per_track))
-        header.extend(struct.pack("<I", track_count | 0x40000000))
+        header.extend(struct.pack("<I", track_count | 0x40000000 | 0x20000000))
         header.extend(struct.pack("<H", default_dma))
+        header.extend(struct.pack("<H", dirbuf_size))
 
         data = bytearray(sector_size * sectors_per_track * track_count)
 
