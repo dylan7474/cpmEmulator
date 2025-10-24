@@ -97,6 +97,7 @@ typedef struct {
     uint8_t bios_selected_disk;
     uint16_t bios_track;
     uint16_t bios_sector;
+    uint8_t bios_last_disk_status;
     bool trap_cpm_calls;
     CpmFileHandle files[CP_M_MAX_OPEN_FILES];
     uint16_t bios_dph_addresses[CP_M_MAX_DISK_DRIVES];
@@ -3371,22 +3372,49 @@ static void handle_out(Emulator *emu, uint8_t port, uint8_t value)
         return;
     }
 
-    if (port == 0x01U) {
+    switch (port) {
+    case 0x01U:
         cpm_bios_console_output(emu, value);
         return;
-    }
-
-    if (port == 0x03U) {
+    case 0x03U:
         cpm_bdos_output_punch(emu, value);
         return;
-    }
-
-    if (port == 0x05U) {
+    case 0x05U:
         cpm_bdos_output_list(emu, value);
         return;
+    case 0x0AU:
+        if (value < CP_M_MAX_DISK_DRIVES) {
+            emu->bios_selected_disk = value;
+            emu->default_drive = value;
+        } else {
+            emu->bios_selected_disk = 0xFFU;
+        }
+        emu->bios_track = 0U;
+        emu->bios_sector = 1U;
+        cpm_reset_directory_search(emu);
+        return;
+    case 0x0BU:
+        emu->bios_track = (uint16_t)value;
+        return;
+    case 0x0CU:
+        emu->bios_sector = value;
+        return;
+    case 0x0DU: {
+        bool write = (value & 0x01U) != 0U;
+        uint8_t status = cpm_bios_transfer_sector(emu, write);
+        emu->bios_last_disk_status = (status == (uint8_t)DISK_STATUS_OK) ? 0x00U : 0x01U;
+        return;
+    }
+    case 0x0FU:
+        emu->dma_address = (uint16_t)((emu->dma_address & 0xFF00U) | value);
+        return;
+    case 0x10U:
+        emu->dma_address = (uint16_t)((emu->dma_address & 0x00FFU) | ((uint16_t)value << 8));
+        return;
+    default:
+        break;
     }
 
-    (void)port;
     (void)value;
 }
 
@@ -3396,7 +3424,10 @@ static uint8_t handle_in(Emulator *emu, uint8_t port)
         return 0x00U;
     }
 
-    if (port == 0x01U) {
+    switch (port) {
+    case 0x00U:
+        return cpm_bdos_console_status(emu);
+    case 0x01U:
         if (cpm_bdos_console_status(emu) == 0x00U) {
             return 0x00U;
         }
@@ -3407,13 +3438,20 @@ static uint8_t handle_in(Emulator *emu, uint8_t port)
             return 0x00U;
         }
         return (uint8_t)ch;
+    case 0x02U:
+        return 0xFFU;
+    case 0x05U:
+        return cpm_bdos_reader_input(emu);
+    case 0x0EU:
+        return emu->bios_last_disk_status;
+    case 0x0FU:
+        return (uint8_t)(emu->dma_address & 0x00FFU);
+    case 0x10U:
+        return (uint8_t)((emu->dma_address >> 8) & 0x00FFU);
+    default:
+        break;
     }
 
-    if (port == 0x00U) {
-        return cpm_bdos_console_status(emu);
-    }
-
-    (void)port;
     return 0x00U;
 }
 
@@ -4000,6 +4038,7 @@ static void emulator_init(Emulator *emu)
     emu->bios_selected_disk = 0xFFU;
     emu->bios_track = 0U;
     emu->bios_sector = 1U;
+    emu->bios_last_disk_status = 0x01U;
     emu->trap_cpm_calls = true;
     emu->bios_table_next = BIOS_TABLE_REGION_END;
     emu->default_drive = 0U;
