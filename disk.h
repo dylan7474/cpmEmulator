@@ -24,11 +24,53 @@ typedef enum {
 } DiskStatus;
 
 typedef struct {
+    uint16_t spt;
+    uint8_t bsh;
+    uint8_t blm;
+    uint8_t exm;
+    uint16_t dsm;
+    uint16_t drm;
+    uint8_t al0;
+    uint8_t al1;
+    uint16_t cks;
+    uint16_t off;
+} DiskParameterBlock;
+
+typedef struct {
+    uint8_t user_number;
+    bool is_empty;
+    bool is_deleted;
+    char filename[9];
+    char extension[4];
+    char filename_padded[8];
+    char extension_padded[3];
+    uint8_t extent;
+    uint8_t s1;
+    uint8_t s2;
+    uint8_t record_count;
+    uint8_t allocations[16];
+    size_t allocation_count;
+    uint8_t raw[32];
+} DiskDirectoryEntry;
+
+typedef struct {
     FILE *fp;
     DiskGeometry geometry;
     size_t image_size;
     bool mounted;
     bool read_only;
+    DiskParameterBlock parameter_block;
+    bool parameter_block_valid;
+    size_t records_per_track;
+    size_t block_records;
+    size_t reserved_tracks;
+    size_t directory_offset;
+    size_t directory_entries;
+    size_t allocation_vector_bytes;
+    uint8_t *cache;
+    size_t cache_track;
+    size_t cache_sector;
+    bool cache_valid;
 } DiskDrive;
 
 int disk_mount(DiskDrive *drive, const char *path, const DiskGeometry *geometry);
@@ -36,6 +78,11 @@ DiskStatus disk_read_sector(DiskDrive *drive, size_t track, size_t sector, uint8
 DiskStatus disk_write_sector(DiskDrive *drive, size_t track, size_t sector, const uint8_t *buffer, size_t length);
 void disk_unmount(DiskDrive *drive);
 bool disk_is_mounted(const DiskDrive *drive);
+const DiskParameterBlock *disk_parameter_block(const DiskDrive *drive);
+size_t disk_directory_entry_count(const DiskDrive *drive);
+size_t disk_allocation_vector_bytes(const DiskDrive *drive);
+DiskStatus disk_read_directory_entry(DiskDrive *drive, size_t index, DiskDirectoryEntry *entry);
+void disk_invalidate_cache(DiskDrive *drive);
 
 static inline size_t disk_sector_size(const DiskDrive *drive)
 {
