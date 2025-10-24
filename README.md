@@ -94,6 +94,8 @@ Key flags:
 
 Once the machine reaches the CCP prompt, you can run any CP/M commands available on the mounted media.
 
+Mounting a disk image with `--disk` is optional—omit the flag entirely if you only need to confirm that the supervisor stack boots. When you do want storage attached but don't already have a CP/M disk handy, the `scripts/run_cpm_system_image_test.sh` helper shows how to fabricate a minimal one: it writes a single-track file containing 26 sectors of 128 bytes each and preloads a short message for the BIOS regression. You can reuse that geometry to build a blank image of the same size with your preferred tooling (for example, via a short Python or `dd` snippet) and pass its path to `--disk A:` to have it appear as drive A: in the CP/M session.
+
 ### Inspecting BIOS disk tables
 
 When one or more disk images are mounted, the emulator reserves a BIOS workspace near the top of memory so CP/M software can interrogate the host geometry without custom patches. The word stored at `0xF000` contains the pointer to the drive table, which in turn stores one disk parameter header (DPH) pointer per drive. The byte at `0xF002` reports how many of those entries correspond to mounted drives. Each DPH references a drive-specific disk parameter block (DPB), allocation vector, and scratch buffers. The layout matches the CP/M 2.2 conventions, so `SELDSK` returns the same DPH pointer and utilities can walk the table directly to discover the sector size, tracks-per-disk, and reserved-directory allocation for each image.
