@@ -64,6 +64,11 @@ int main(int argc, char **argv)
         ok = false;
     }
 
+    if (drive.has_default_dma) {
+        fprintf(stderr, "unexpected default DMA value: 0x%04X\n", drive.default_dma_address);
+        ok = false;
+    }
+
     uint8_t *buffer = (uint8_t *)malloc(EXPECTED_SECTOR_SIZE);
     if (buffer == NULL) {
         fprintf(stderr, "Failed to allocate sector buffer\n");

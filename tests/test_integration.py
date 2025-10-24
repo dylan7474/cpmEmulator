@@ -387,6 +387,125 @@ class RandomRecordIoTest(unittest.TestCase):
                 output_path.unlink()
 
 
+class ReaderDeviceTest(unittest.TestCase):
+    def test_reader_device_consumes_stream(self) -> None:
+        _build_emulator()
+
+        payload = [ord(ch) for ch in "TAPE!"]
+
+        assembly_lines = ["org 0x0100", "start:"]
+        for _ in payload:
+            assembly_lines.extend(
+                [
+                    "    mvi c, 0x03",
+                    "    call 0x0005",
+                    "    mov e, a",
+                    "    mvi c, 0x02",
+                    "    call 0x0005",
+                ]
+            )
+        assembly_lines.extend(
+            [
+                "    mvi e, 0x0D",
+                "    mvi c, 0x02",
+                "    call 0x0005",
+                "    mvi e, 0x0A",
+                "    mvi c, 0x02",
+                "    call 0x0005",
+                "    mvi c, 0x00",
+                "    call 0x0005",
+            ]
+        )
+
+        program_bytes = assemble_source_lines(assembly_lines)
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            binary_path = Path(tmpdir) / "reader.bin"
+            binary_path.write_bytes(program_bytes)
+            reader_path = Path(tmpdir) / "tape.dat"
+            reader_path.write_bytes(bytes(payload))
+
+            result = subprocess.run(
+                [str(REPO_ROOT / "z80"), "--reader", str(reader_path), str(binary_path)],
+                cwd=REPO_ROOT,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                check=False,
+            )
+
+        self.assertEqual(result.returncode, 0, msg=f"Reader regression failed:\n{result.stdout}")
+        self.assertIn("TAPE!", result.stdout)
+
+
+class FileAttributeTest(unittest.TestCase):
+    def test_system_and_archive_bits_are_persisted(self) -> None:
+        _build_emulator()
+
+        logical = bytearray([0xE5] * (26 * 128))
+        entry = bytearray(32)
+        entry[0] = 0x00
+        name = "ATTRTEST"
+        for index, char in enumerate(name):
+            entry[1 + index] = ord(char)
+        ext_values = [0x53, 0x59, 0x53]
+        for index, value in enumerate(ext_values):
+            entry[9 + index] = value
+        logical[:32] = entry
+
+        program_lines = ["org 0x0100", "start:"]
+        program_lines.extend(
+            [
+                "    mvi a, 0x01",
+                "    sta 0x005C",
+            ]
+        )
+        for offset, char in enumerate(name):
+            program_lines.append(f"    mvi a, 0x{ord(char):02X}")
+            program_lines.append(f"    sta 0x{0x005D + offset:04X}")
+        attr_bytes = [0x53, 0xD9, 0xD3]
+        for offset, value in enumerate(attr_bytes):
+            program_lines.append(f"    mvi a, 0x{value:02X}")
+            program_lines.append(f"    sta 0x{0x0065 + offset:04X}")
+        program_lines.extend(
+            [
+                "    lxi d, 0x005C",
+                "    mvi c, 0x1E",
+                "    call 0x0005",
+                "    mvi c, 0x00",
+                "    call 0x0005",
+            ]
+        )
+
+        program_bytes = assemble_source_lines(program_lines)
+
+        disk_bytes = bytes(logical)
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            disk_path = Path(tmpdir) / "attr.img"
+            disk_path.write_bytes(disk_bytes)
+
+            binary_path = Path(tmpdir) / "setattr.bin"
+            binary_path.write_bytes(program_bytes)
+
+            result = subprocess.run(
+                [str(REPO_ROOT / "z80"), "--disk", f"A:{disk_path}", str(binary_path)],
+                cwd=REPO_ROOT,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                check=False,
+            )
+
+            updated = disk_path.read_bytes()
+
+        self.assertEqual(result.returncode, 0, msg=f"Attribute helper failed:\n{result.stdout}")
+        entry_after = updated[:32]
+        self.assertEqual(entry_after[9], 0x53)
+        self.assertEqual(entry_after[10], 0xD9)
+        self.assertEqual(entry_after[11], 0xD3)
+
+
 class DiskTranslationTableTest(unittest.TestCase):
     def test_directory_enumeration_matches_translation(self) -> None:
         translation = [(i * 5) % 26 for i in range(26)]
@@ -486,6 +605,91 @@ class DiskHeaderInferenceTest(unittest.TestCase):
             )
 
         self.assertEqual(result.returncode, 0, msg=f"disk header helper failed:\n{result.stdout}")
+
+
+class DiskHeaderDmaIntegrationTest(unittest.TestCase):
+    def test_header_reports_default_dma(self) -> None:
+        _build_emulator()
+
+        sector_size = 128
+        sectors_per_track = 26
+        track_count = 2
+        default_dma = 0x0200
+
+        header = bytearray()
+        header.extend(b"CPMI")
+        header.extend(struct.pack("<I", sector_size))
+        header.extend(struct.pack("<I", sectors_per_track))
+        header.extend(struct.pack("<I", track_count | 0x40000000))
+        header.extend(struct.pack("<H", default_dma))
+
+        data = bytearray(sector_size * sectors_per_track * track_count)
+
+        assembly_lines = [
+            "org 0x0100",
+            "start:",
+            "    mvi c, 0x09",
+            "    lxi d, message",
+            "    call 0x0005",
+            "    lda 0xF005",
+            "    call print_byte",
+            "    lda 0xF004",
+            "    call print_byte",
+            "    mvi e, 0x0D",
+            "    mvi c, 0x02",
+            "    call 0x0005",
+            "    mvi e, 0x0A",
+            "    mvi c, 0x02",
+            "    call 0x0005",
+            "    mvi c, 0x00",
+            "    call 0x0005",
+            "print_byte:",
+            "    sta temp_byte",
+            "    db 0xE6, 0xF0",
+            "    db 0x0F, 0x0F, 0x0F, 0x0F",
+            "    call print_nibble",
+            "    lda temp_byte",
+            "    db 0xE6, 0x0F",
+            "    call print_nibble",
+            "    db 0xC9",
+            "print_nibble:",
+            "    mov e, a",
+            "    mvi d, 0",
+            "    lxi h, hex_table",
+            "    db 0x19",
+            "    mov a, m",
+            "    mov e, a",
+            "    mvi c, 0x02",
+            "    call 0x0005",
+            "    db 0xC9",
+            "message:",
+            "    db 'DMA=$'",
+            "hex_table:",
+            "    db '0123456789ABCDEF'",
+            "temp_byte:",
+            "    db 0x00",
+        ]
+
+        program_bytes = assemble_source_lines(assembly_lines)
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            image_path = Path(tmpdir) / "dma_header.img"
+            image_path.write_bytes(header + data)
+
+            binary_path = Path(tmpdir) / "print_dma.bin"
+            binary_path.write_bytes(program_bytes)
+
+            result = subprocess.run(
+                [str(REPO_ROOT / "z80"), "--disk", f"A:{image_path}", str(binary_path)],
+                cwd=REPO_ROOT,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                check=False,
+            )
+
+        self.assertEqual(result.returncode, 0, msg=f"DMA header probe failed:\n{result.stdout}")
+        self.assertIn("DMA=0200", result.stdout)
 
 
 if __name__ == "__main__":

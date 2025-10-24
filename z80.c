@@ -491,6 +491,13 @@ static bool bios_initialise_drive_tables(Emulator *emu)
 
     bool default_set = false;
     uint8_t drive_count = 0U;
+    uint16_t dma_table_base = (uint16_t)(BIOS_TABLE_REGION_START + 4U);
+    for (size_t i = 0U; i < CP_M_MAX_DISK_DRIVES; ++i) {
+        memory_write16(emu, (uint16_t)(dma_table_base + (uint16_t)(i * 2U)), 0x0000U);
+    }
+
+    uint16_t initial_dma = emu->dma_address;
+    bool initial_dma_overridden = false;
 
     for (size_t i = 0U; i < CP_M_MAX_DISK_DRIVES; ++i) {
         DiskDrive *drive = &emu->disks[i];
@@ -579,6 +586,8 @@ static bool bios_initialise_drive_tables(Emulator *emu)
                 if (!default_set) {
                     emu->default_drive = (uint8_t)i;
                     default_set = true;
+                    initial_dma = drive->has_default_dma ? drive->default_dma_address : CP_M_DEFAULT_DMA;
+                    initial_dma_overridden = true;
                 }
                 ++drive_count;
             }
@@ -588,6 +597,12 @@ static bool bios_initialise_drive_tables(Emulator *emu)
         if (emu->bios_drive_table_address != 0U) {
             memory_write16(emu, (uint16_t)(emu->bios_drive_table_address + (uint16_t)(i * 2U)), dph_addr);
         }
+
+        uint16_t dma_value = 0U;
+        if (disk_is_mounted(drive)) {
+            dma_value = drive->has_default_dma ? drive->default_dma_address : CP_M_DEFAULT_DMA;
+        }
+        memory_write16(emu, (uint16_t)(dma_table_base + (uint16_t)(i * 2U)), dma_value);
     }
 
     if (!default_set) {
@@ -596,6 +611,10 @@ static bool bios_initialise_drive_tables(Emulator *emu)
 
     memory_write16(emu, BIOS_TABLE_REGION_START, emu->bios_drive_table_address);
     memory_write8(emu, (uint16_t)(BIOS_TABLE_REGION_START + 2U), drive_count);
+
+    if (initial_dma_overridden) {
+        emu->dma_address = initial_dma;
+    }
 
     return true;
 }
@@ -954,6 +973,10 @@ static uint8_t cpm_bdos_set_file_attributes(Emulator *emu, uint16_t fcb_address)
 
     uint8_t attr_byte = memory_read8(emu, (uint16_t)(fcb_address + 9U));
     bool set_read_only = (attr_byte & 0x80U) != 0U;
+    uint8_t system_byte = memory_read8(emu, (uint16_t)(fcb_address + 10U));
+    bool set_system = (system_byte & 0x80U) != 0U;
+    uint8_t archive_byte = memory_read8(emu, (uint16_t)(fcb_address + 11U));
+    bool set_archive = (archive_byte & 0x80U) != 0U;
 
     bool updated = false;
     size_t total = disk_directory_entry_count(drive);
@@ -977,6 +1000,18 @@ static uint8_t cpm_bdos_set_file_attributes(Emulator *emu, uint16_t fcb_address)
             new_raw[9] &= 0x7FU;
         }
 
+        if (set_system) {
+            new_raw[10] |= 0x80U;
+        } else {
+            new_raw[10] &= 0x7FU;
+        }
+
+        if (set_archive) {
+            new_raw[11] |= 0x80U;
+        } else {
+            new_raw[11] &= 0x7FU;
+        }
+
         status = disk_write_directory_entry(drive, index, new_raw);
         if (status != DISK_STATUS_OK) {
             return 0xFFU;
@@ -996,6 +1031,22 @@ static uint8_t cpm_bdos_set_file_attributes(Emulator *emu, uint16_t fcb_address)
         updated_attr &= 0x7FU;
     }
     memory_write8(emu, (uint16_t)(fcb_address + 9U), updated_attr);
+
+    uint8_t updated_system = memory_read8(emu, (uint16_t)(fcb_address + 10U));
+    if (set_system) {
+        updated_system |= 0x80U;
+    } else {
+        updated_system &= 0x7FU;
+    }
+    memory_write8(emu, (uint16_t)(fcb_address + 10U), updated_system);
+
+    uint8_t updated_archive = memory_read8(emu, (uint16_t)(fcb_address + 11U));
+    if (set_archive) {
+        updated_archive |= 0x80U;
+    } else {
+        updated_archive &= 0x7FU;
+    }
+    memory_write8(emu, (uint16_t)(fcb_address + 11U), updated_archive);
 
     cpm_reset_directory_search(emu);
     return 0x00U;
@@ -1038,7 +1089,8 @@ static bool cpm_prepare_directory_search(Emulator *emu, uint16_t fcb_address, Di
     state->user_number = 0xFFU;
 
     for (size_t i = 0U; i < 8U; ++i) {
-        char ch = (char)memory_read8(emu, (uint16_t)(fcb_address + 1U + i));
+        uint8_t raw = memory_read8(emu, (uint16_t)(fcb_address + 1U + i));
+        char ch = (char)(raw & 0x7FU);
         if (ch >= 'a' && ch <= 'z') {
             ch = (char)(ch - ('a' - 'A'));
         }
@@ -1053,7 +1105,8 @@ static bool cpm_prepare_directory_search(Emulator *emu, uint16_t fcb_address, Di
     state->filename_pattern[8] = '\0';
 
     for (size_t i = 0U; i < 3U; ++i) {
-        char ch = (char)memory_read8(emu, (uint16_t)(fcb_address + 9U + i));
+        uint8_t raw = memory_read8(emu, (uint16_t)(fcb_address + 9U + i));
+        char ch = (char)(raw & 0x7FU);
         if (ch >= 'a' && ch <= 'z') {
             ch = (char)(ch - ('a' - 'A'));
         }
@@ -4079,6 +4132,8 @@ static bool parse_disk_geometry_spec(const char *spec, int *drive_index, DiskGeo
 
     geometry->translation_table = NULL;
     geometry->translation_table_length = 0U;
+    geometry->default_dma_address = 0U;
+    geometry->has_default_dma = false;
     geometry->allow_header = false;
 
     size_t len = strlen(spec);
@@ -4252,6 +4307,8 @@ int main(int argc, char **argv)
         disk_geometries[i].sector_size = DISK_DEFAULT_SECTOR_BYTES;
         disk_geometries[i].translation_table = NULL;
         disk_geometries[i].translation_table_length = 0U;
+        disk_geometries[i].default_dma_address = 0U;
+        disk_geometries[i].has_default_dma = false;
         disk_geometries[i].translation_table_owned = false;
         disk_geometries[i].allow_header = true;
         disk_translation_tables[i] = NULL;
