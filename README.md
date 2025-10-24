@@ -97,12 +97,14 @@ Because most peripheral behaviours and a handful of less common opcodes are stil
 
 When mounting images that begin with the 16-byte `CPMI` header, the emulator now extracts the encoded sector size, sectors per track, and optional track count automatically. The three highest bits of the track-count field act as feature flags: bit 31 indicates that the header is followed by a translation-table length and one byte per logical sector describing the BIOS skew order (using the familiar 1-based numbering), bit 30 signals that a 16-bit little-endian default DMA address is stored immediately after the header, bit 29 advertises a 16-bit little-endian directory-buffer size that the BIOS uses when reserving scratch space for that drive, and bit 28 appends a single-byte attribute hint whose low bits seed the BDOS read-only vector before any directory traversal occurs. Optional sections appear in that order, and the payload immediately following the header (and any optional sections) is treated as the first sector, so existing raw media remain compatible while curated images can embed geometry, translation, DMA, attribute, and BIOS workspace metadata for convenience.
 
+Directory updates issued by BDOS now reapply those CPMI attribute hints before writing sectors back to disk, so the seeded read-only bits persist across cold and warm boots even when directory entries churn.
+
+
 ### Exercising CP/M system images
 
 To validate the IX/IY-prefixed instruction paths against real system software, the test suite stores base64-encoded CP/M 2.2 supervisor images sourced from the [z80pack](https://github.com/udo-munk/z80pack) reconstruction. The helper script invoked by `make test` decodes the CCP/BDOS bundle (`cpm.bin.base64`) and BIOS stub (`bios.bin.base64`) into temporary binaries, maps them at `0xDC00` and `0xFA00`, disables the host BDOS/BIOS shims, and executes the machine for 500,000 T-states. When the emulator completes without reporting unimplemented opcodes, the IX/IY-prefixed execution paths have been exercised against the full CP/M supervisor stack. Mount a disk image with `--disk A:path` to extend the experiment to filesystem and console integration as new device emulation features land.
 
 ## Next steps
-- Persist CPMI attribute hints when BDOS rewrites directory entries so seeded read-only bits survive across cold and warm boots.
 - Add a supervisor-level regression that spools output via `PIP` or a similar utility to confirm the new port handlers capture punch and list traffic end-to-end.
 
 Contributions that expand opcode coverage, improve testing, or add CP/M-compatible peripherals are welcome.

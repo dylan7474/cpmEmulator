@@ -213,9 +213,30 @@ fail:
     return false;
 }
 
-static void disk_apply_host_read_only_flag(const DiskDrive *drive, uint8_t *entry_raw)
+static bool disk_should_overlay_read_only(const DiskDrive *drive)
 {
-    if (drive == NULL || entry_raw == NULL || !drive->read_only) {
+    if (drive == NULL) {
+        return false;
+    }
+
+    if (drive->host_read_only || drive->header_read_only) {
+        return true;
+    }
+
+    if (drive->has_attribute_hints && (drive->attribute_flags & DISK_ATTRIBUTE_FLAG_READ_ONLY) != 0U) {
+        return true;
+    }
+
+    return false;
+}
+
+static void disk_apply_read_only_overlay(const DiskDrive *drive, uint8_t *entry_raw)
+{
+    if (drive == NULL || entry_raw == NULL) {
+        return;
+    }
+
+    if (!disk_should_overlay_read_only(drive)) {
         return;
     }
 
@@ -569,10 +590,10 @@ static bool disk_refresh_directory_metadata(DiskDrive *drive)
         }
     }
 
-    if (drive->read_only) {
+    if (disk_should_overlay_read_only(drive)) {
         size_t entry_count = drive->directory_metadata_bytes / 32U;
         for (size_t i = 0U; i < entry_count; ++i) {
-            disk_apply_host_read_only_flag(drive, drive->directory_metadata + i * 32U);
+            disk_apply_read_only_overlay(drive, drive->directory_metadata + i * 32U);
         }
     }
 
@@ -1177,7 +1198,7 @@ DiskStatus disk_read_directory_entry(DiskDrive *drive, size_t index, DiskDirecto
         }
     }
 
-    disk_apply_host_read_only_flag(drive, raw);
+    disk_apply_read_only_overlay(drive, raw);
     disk_parse_directory_entry_bytes(raw, entry);
     return DISK_STATUS_OK;
 }
@@ -1207,6 +1228,10 @@ DiskStatus disk_write_directory_entry(DiskDrive *drive, size_t index, const uint
     size_t sector = track_offset / drive->geometry.sector_size;
     size_t sector_offset = track_offset % drive->geometry.sector_size;
 
+    uint8_t persisted[32];
+    memcpy(persisted, raw, sizeof(persisted));
+    disk_apply_read_only_overlay(drive, persisted);
+
     size_t remaining = 32U;
     size_t copied = 0U;
 
@@ -1224,7 +1249,7 @@ DiskStatus disk_write_directory_entry(DiskDrive *drive, size_t index, const uint
 
         size_t available = drive->geometry.sector_size - sector_offset;
         size_t take = (remaining < available) ? remaining : available;
-        memcpy(buffer + sector_offset, raw + copied, take);
+        memcpy(buffer + sector_offset, persisted + copied, take);
 
         status = disk_write_sector(drive, track, sector, buffer, drive->geometry.sector_size);
         if (status != DISK_STATUS_OK) {

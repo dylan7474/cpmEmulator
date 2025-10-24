@@ -103,6 +103,48 @@ int main(int argc, char **argv)
         }
     }
 
+    if (ok) {
+        bool original_read_only = drive.read_only;
+        bool original_header_ro = drive.header_read_only;
+        bool original_host_ro = drive.host_read_only;
+        bool original_has_hints = drive.has_attribute_hints;
+        uint8_t original_attr_flags = drive.attribute_flags;
+
+        drive.read_only = false;
+        drive.header_read_only = false;
+        drive.host_read_only = false;
+        drive.has_attribute_hints = true;
+        drive.attribute_flags = DISK_ATTRIBUTE_FLAG_READ_ONLY;
+
+        uint8_t entry[32];
+        memset(entry, 0, sizeof(entry));
+        entry[0] = 0x01;
+        memcpy(&entry[1], "HINTFILE", 8);
+        memcpy(&entry[9], "TXT", 3);
+
+        DiskStatus write_status = disk_write_directory_entry(&drive, 0U, entry);
+        if (write_status != DISK_STATUS_OK) {
+            fprintf(stderr, "disk_write_directory_entry failed: %d\n", (int)write_status);
+            ok = false;
+        } else {
+            DiskDirectoryEntry loaded;
+            DiskStatus read_status = disk_read_directory_entry(&drive, 0U, &loaded);
+            if (read_status != DISK_STATUS_OK) {
+                fprintf(stderr, "disk_read_directory_entry failed: %d\n", (int)read_status);
+                ok = false;
+            } else if ((loaded.raw[9] & 0x80U) == 0U) {
+                fprintf(stderr, "CPMI attribute hint overlay did not persist read-only bit\n");
+                ok = false;
+            }
+        }
+
+        drive.read_only = original_read_only;
+        drive.header_read_only = original_header_ro;
+        drive.host_read_only = original_host_ro;
+        drive.has_attribute_hints = original_has_hints;
+        drive.attribute_flags = original_attr_flags;
+    }
+
     free(buffer);
     disk_unmount(&drive);
 
