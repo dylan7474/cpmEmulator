@@ -82,7 +82,7 @@ To wire up the console session manually, mimic the options used by the helper sc
   --load 0xDC00:/tmp/cpm.bin \
   --load 0xFA00:/tmp/bios.bin \
   --disk A:path/to/disk.img \
-  --cycles 500000
+  --cycles 0
 ```
 
 Key flags:
@@ -118,7 +118,7 @@ After validating the supervisor image, the regression mounts a generated single-
 
 Useful command-line options:
 
-- `--cycles N` – Limit execution to `N` T-states before halting automatically (default: 1,000,000).
+- `--cycles N` – Limit execution to `N` T-states before halting automatically (default: 1,000,000). Pass `0` to run without a cap until the guest HALTs.
 - `--disk DRIVE:path` – Mount a raw disk image on CP/M drive letter `DRIVE` (for example, `--disk B:disks/work.img`). The legacy shorthand `--disk-a` is still accepted for convenience.
 - `--disk-geom DRIVE:spt:ssize[:tracks]` – Override the sectors per track, sector size in bytes, and optional track count before mounting a drive. Geometry defaults to 26×128-byte sectors when unspecified.
 - `--disk-xlt DRIVE:map` – Provide a comma-separated list of 1-based sector numbers describing the BIOS translation order for each track (for example, `--disk-xlt A:1,5,9,13,17,21,25,2,6,...`).

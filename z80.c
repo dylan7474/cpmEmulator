@@ -4774,7 +4774,7 @@ int main(int argc, char **argv)
     emu.cpu.pc = entry_point;
 
     uint64_t cycles = 0ULL;
-    while (!emu.cpu.halted && cycles < max_cycles) {
+    while (!emu.cpu.halted && (max_cycles == 0ULL || cycles < max_cycles)) {
         cycles += (uint64_t)z80_step(&emu);
     }
 
