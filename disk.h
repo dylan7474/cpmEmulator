@@ -15,6 +15,7 @@ typedef struct {
     size_t sector_size;
     const uint8_t *translation_table;
     size_t translation_table_length;
+    bool translation_table_owned;
     bool allow_header;
 } DiskGeometry;
 
@@ -94,6 +95,7 @@ size_t disk_allocation_vector_bytes(const DiskDrive *drive);
 const uint8_t *disk_allocation_vector(const DiskDrive *drive);
 const uint8_t *disk_translation_table(const DiskDrive *drive, size_t *length);
 DiskStatus disk_read_directory_entry(DiskDrive *drive, size_t index, DiskDirectoryEntry *entry);
+DiskStatus disk_write_directory_entry(DiskDrive *drive, size_t index, const uint8_t raw[32]);
 void disk_invalidate_cache(DiskDrive *drive);
 void disk_update_allocation_vector(DiskDrive *drive, const uint8_t *data, size_t length);
 

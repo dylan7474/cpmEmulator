@@ -46,8 +46,11 @@ static bool disk_try_apply_header(FILE *fp, DiskGeometry *geom, size_t file_size
                            | ((uint32_t)header[7] << 24);
     uint32_t sectors_per_track = (uint32_t)header[8] | ((uint32_t)header[9] << 8) | ((uint32_t)header[10] << 16)
                                  | ((uint32_t)header[11] << 24);
-    uint32_t track_count = (uint32_t)header[12] | ((uint32_t)header[13] << 8) | ((uint32_t)header[14] << 16)
-                           | ((uint32_t)header[15] << 24);
+    uint32_t track_count_raw = (uint32_t)header[12] | ((uint32_t)header[13] << 8) | ((uint32_t)header[14] << 16)
+                               | ((uint32_t)header[15] << 24);
+
+    bool header_has_translation = (track_count_raw & 0x80000000U) != 0U;
+    track_count_raw &= 0x7FFFFFFFU;
 
     if (sector_size == 0U || sectors_per_track == 0U) {
         (void)fseek(fp, original, SEEK_SET);
@@ -56,15 +59,87 @@ static bool disk_try_apply_header(FILE *fp, DiskGeometry *geom, size_t file_size
 
     geom->sector_size = (size_t)sector_size;
     geom->sectors_per_track = (size_t)sectors_per_track;
-    geom->track_count = (size_t)track_count;
-    *data_offset = DISK_HEADER_SIZE;
+    geom->track_count = (size_t)track_count_raw;
+
+    size_t offset = DISK_HEADER_SIZE;
+    uint8_t *allocated_table = NULL;
+    size_t translation_entries = 0U;
+
+    if (header_has_translation) {
+        if (file_size < DISK_HEADER_SIZE + 4U) {
+            goto fail;
+        }
+
+        uint8_t length_bytes[4];
+        if (fread(length_bytes, 1U, sizeof(length_bytes), fp) != sizeof(length_bytes)) {
+            goto fail;
+        }
+
+        translation_entries = (size_t)((uint32_t)length_bytes[0] | ((uint32_t)length_bytes[1] << 8)
+                                        | ((uint32_t)length_bytes[2] << 16) | ((uint32_t)length_bytes[3] << 24));
+        offset += sizeof(length_bytes);
+
+        if (translation_entries == 0U) {
+            header_has_translation = false;
+        } else {
+            if (translation_entries > sectors_per_track) {
+                goto fail;
+            }
+
+            if (file_size < offset + translation_entries) {
+                goto fail;
+            }
+
+            uint8_t *table_bytes = (uint8_t *)malloc(translation_entries);
+            if (table_bytes == NULL) {
+                goto fail;
+            }
+
+            if (fread(table_bytes, 1U, translation_entries, fp) != translation_entries) {
+                free(table_bytes);
+                goto fail;
+            }
+
+            offset += translation_entries;
+
+            if (geom->translation_table == NULL && geom->translation_table_length == 0U) {
+                for (size_t i = 0U; i < translation_entries; ++i) {
+                    uint8_t value = table_bytes[i];
+                    if (value == 0U || value > sectors_per_track) {
+                        free(table_bytes);
+                        goto fail;
+                    }
+                    table_bytes[i] = (uint8_t)(value - 1U);
+                }
+
+                geom->translation_table = table_bytes;
+                geom->translation_table_length = translation_entries;
+                geom->translation_table_owned = true;
+                allocated_table = table_bytes;
+            } else {
+                free(table_bytes);
+            }
+        }
+    }
+
+    *data_offset = offset;
 
     if (fseek(fp, (long)*data_offset, SEEK_SET) != 0) {
-        (void)fseek(fp, original, SEEK_SET);
-        return false;
+        goto fail;
     }
 
     return true;
+
+fail:
+    if (allocated_table != NULL) {
+        free(allocated_table);
+        geom->translation_table = NULL;
+        geom->translation_table_length = 0U;
+        geom->translation_table_owned = false;
+    }
+
+    (void)fseek(fp, original, SEEK_SET);
+    return false;
 }
 
 static void disk_apply_host_read_only_flag(const DiskDrive *drive, uint8_t *entry_raw)
@@ -633,33 +708,35 @@ int disk_mount(DiskDrive *drive, const char *path, const DiskGeometry *geometry)
         return -1;
     }
 
-    FILE *fp = fopen(path, "r+b");
+    FILE *fp = NULL;
+    uint8_t *cache = NULL;
+    uint8_t *header_translation = NULL;
     bool read_only = false;
+    size_t image_size = 0U;
+    size_t data_offset = 0U;
+    int result = -1;
+
+    fp = fopen(path, "r+b");
     if (fp == NULL) {
         fp = fopen(path, "rb");
         read_only = true;
         if (fp == NULL) {
-            return -1;
+            goto fail;
         }
     }
 
     if (fseek(fp, 0L, SEEK_END) != 0) {
-        fclose(fp);
-        return -1;
+        goto fail;
     }
 
     long file_size = ftell(fp);
     if (file_size < 0) {
-        fclose(fp);
-        return -1;
+        goto fail;
     }
 
-    size_t image_size = (size_t)file_size;
-    size_t data_offset = 0U;
-
+    image_size = (size_t)file_size;
     if (fseek(fp, 0L, SEEK_SET) != 0) {
-        fclose(fp);
-        return -1;
+        goto fail;
     }
 
     if (geom.allow_header) {
@@ -668,15 +745,17 @@ int disk_mount(DiskDrive *drive, const char *path, const DiskGeometry *geometry)
             data_offset = header_offset;
         } else {
             if (fseek(fp, 0L, SEEK_SET) != 0) {
-                fclose(fp);
-                return -1;
+                goto fail;
             }
         }
     }
 
+    if (geom.translation_table_owned && geom.translation_table != NULL) {
+        header_translation = (uint8_t *)geom.translation_table;
+    }
+
     if (data_offset > image_size) {
-        fclose(fp);
-        return -1;
+        goto fail;
     }
 
     image_size -= data_offset;
@@ -688,26 +767,22 @@ int disk_mount(DiskDrive *drive, const char *path, const DiskGeometry *geometry)
             geom.track_count = image_size / track_bytes;
         } else {
             if (geom.track_count > SIZE_MAX / track_bytes) {
-                fclose(fp);
-                return -1;
+                goto fail;
             }
             size_t required = geom.track_count * track_bytes;
             if (required > image_size) {
-                fclose(fp);
-                return -1;
+                goto fail;
             }
         }
     }
 
     if (fseek(fp, (long)data_offset, SEEK_SET) != 0) {
-        fclose(fp);
-        return -1;
+        goto fail;
     }
 
-    uint8_t *cache = (uint8_t *)malloc(geom.sector_size);
+    cache = (uint8_t *)malloc(geom.sector_size);
     if (cache == NULL) {
-        fclose(fp);
-        return -1;
+        goto fail;
     }
 
     disk_unmount(drive);
@@ -725,11 +800,14 @@ int disk_mount(DiskDrive *drive, const char *path, const DiskGeometry *geometry)
     drive->translation_table = NULL;
     drive->translation_table_entries = 0U;
 
+    fp = NULL;
+    cache = NULL;
+
     if (geom.sectors_per_track > 0U) {
         drive->translation_table = (uint8_t *)malloc(geom.sectors_per_track);
         if (drive->translation_table == NULL) {
             disk_unmount(drive);
-            return -1;
+            goto fail;
         }
         drive->translation_table_entries = geom.sectors_per_track;
         for (size_t i = 0U; i < geom.sectors_per_track; ++i) {
@@ -739,18 +817,26 @@ int disk_mount(DiskDrive *drive, const char *path, const DiskGeometry *geometry)
         if (geom.translation_table_length > 0U) {
             if (geom.translation_table == NULL || geom.translation_table_length != geom.sectors_per_track) {
                 disk_unmount(drive);
-                return -1;
+                goto fail;
             }
 
             for (size_t i = 0U; i < geom.translation_table_length; ++i) {
                 uint8_t value = geom.translation_table[i];
                 if (value >= geom.sectors_per_track) {
                     disk_unmount(drive);
-                    return -1;
+                    goto fail;
                 }
                 drive->translation_table[i] = value;
             }
         }
+    }
+
+    if (header_translation != NULL) {
+        free(header_translation);
+        header_translation = NULL;
+        geom.translation_table = NULL;
+        geom.translation_table_length = 0U;
+        geom.translation_table_owned = false;
     }
 
     disk_compute_metadata(drive);
@@ -763,7 +849,7 @@ int disk_mount(DiskDrive *drive, const char *path, const DiskGeometry *geometry)
         drive->directory_metadata = (uint8_t *)malloc(drive->directory_metadata_bytes);
         if (drive->directory_metadata == NULL) {
             disk_unmount(drive);
-            return -1;
+            goto fail;
         }
     }
 
@@ -771,7 +857,7 @@ int disk_mount(DiskDrive *drive, const char *path, const DiskGeometry *geometry)
         drive->allocation_vector_data = (uint8_t *)malloc(drive->allocation_vector_bytes);
         if (drive->allocation_vector_data == NULL) {
             disk_unmount(drive);
-            return -1;
+            goto fail;
         }
         memset(drive->allocation_vector_data, 0, drive->allocation_vector_bytes);
     }
@@ -779,13 +865,28 @@ int disk_mount(DiskDrive *drive, const char *path, const DiskGeometry *geometry)
     if (drive->directory_metadata != NULL) {
         if (!disk_refresh_directory_metadata(drive)) {
             disk_unmount(drive);
-            return -1;
+            goto fail;
         }
     } else if (drive->allocation_vector_data != NULL && !drive->allocation_vector_from_bios) {
         memset(drive->allocation_vector_data, 0, drive->allocation_vector_bytes);
     }
 
-    return 0;
+    result = 0;
+
+fail:
+    if (result != 0) {
+        if (cache != NULL) {
+            free(cache);
+        }
+        if (fp != NULL) {
+            fclose(fp);
+        }
+        if (header_translation != NULL) {
+            free(header_translation);
+        }
+    }
+
+    return result;
 }
 
 DiskStatus disk_read_sector(DiskDrive *drive, size_t track, size_t sector, uint8_t *buffer, size_t length)
@@ -987,6 +1088,70 @@ DiskStatus disk_read_directory_entry(DiskDrive *drive, size_t index, DiskDirecto
 
     disk_apply_host_read_only_flag(drive, raw);
     disk_parse_directory_entry_bytes(raw, entry);
+    return DISK_STATUS_OK;
+}
+
+DiskStatus disk_write_directory_entry(DiskDrive *drive, size_t index, const uint8_t raw[32])
+{
+    if (drive == NULL || raw == NULL || !drive->mounted) {
+        return DISK_STATUS_NOT_READY;
+    }
+
+    if (!drive->parameter_block_valid) {
+        return DISK_STATUS_NOT_READY;
+    }
+
+    if (index >= drive->directory_entries) {
+        return DISK_STATUS_BAD_ADDRESS;
+    }
+
+    size_t track_bytes = drive->geometry.sectors_per_track * drive->geometry.sector_size;
+    if (track_bytes == 0U) {
+        return DISK_STATUS_NOT_READY;
+    }
+
+    size_t entry_offset = drive->directory_offset + index * 32U;
+    size_t track = entry_offset / track_bytes;
+    size_t track_offset = entry_offset % track_bytes;
+    size_t sector = track_offset / drive->geometry.sector_size;
+    size_t sector_offset = track_offset % drive->geometry.sector_size;
+
+    size_t remaining = 32U;
+    size_t copied = 0U;
+
+    uint8_t *buffer = (uint8_t *)malloc(drive->geometry.sector_size);
+    if (buffer == NULL) {
+        return DISK_STATUS_IO_ERROR;
+    }
+
+    while (remaining > 0U) {
+        DiskStatus status = disk_read_sector(drive, track, sector, buffer, drive->geometry.sector_size);
+        if (status != DISK_STATUS_OK) {
+            free(buffer);
+            return status;
+        }
+
+        size_t available = drive->geometry.sector_size - sector_offset;
+        size_t take = (remaining < available) ? remaining : available;
+        memcpy(buffer + sector_offset, raw + copied, take);
+
+        status = disk_write_sector(drive, track, sector, buffer, drive->geometry.sector_size);
+        if (status != DISK_STATUS_OK) {
+            free(buffer);
+            return status;
+        }
+
+        copied += take;
+        remaining -= take;
+        sector_offset = 0U;
+        ++sector;
+        if (sector >= drive->geometry.sectors_per_track) {
+            sector = 0U;
+            ++track;
+        }
+    }
+
+    free(buffer);
     return DISK_STATUS_OK;
 }
 

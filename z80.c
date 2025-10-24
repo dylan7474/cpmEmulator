@@ -83,6 +83,8 @@ typedef struct {
     uint16_t bios_table_next;
     uint8_t default_drive;
     DirectorySearchState directory_search;
+    FILE *reader_fp;
+    bool reader_close;
 } Emulator;
 
 static inline uint16_t z80_bc(const Z80 *cpu)
@@ -927,6 +929,78 @@ static uint8_t cpm_bdos_rename_file(Emulator *emu, uint16_t fcb_address)
     return (rename(source, dest) == 0) ? 0x00U : 0xFFU;
 }
 
+static bool cpm_prepare_directory_search(Emulator *emu, uint16_t fcb_address, DirectorySearchState *state);
+static bool cpm_directory_entry_matches(const DirectorySearchState *state, const DiskDirectoryEntry *entry);
+
+static uint8_t cpm_bdos_set_file_attributes(Emulator *emu, uint16_t fcb_address)
+{
+    if (emu == NULL) {
+        return 0xFFU;
+    }
+
+    DirectorySearchState state;
+    if (!cpm_prepare_directory_search(emu, fcb_address, &state)) {
+        return 0xFFU;
+    }
+
+    if (state.drive >= CP_M_MAX_DISK_DRIVES) {
+        return 0xFFU;
+    }
+
+    DiskDrive *drive = &emu->disks[state.drive];
+    if (!disk_is_mounted(drive) || drive->read_only) {
+        return 0xFFU;
+    }
+
+    uint8_t attr_byte = memory_read8(emu, (uint16_t)(fcb_address + 9U));
+    bool set_read_only = (attr_byte & 0x80U) != 0U;
+
+    bool updated = false;
+    size_t total = disk_directory_entry_count(drive);
+    for (size_t index = 0U; index < total; ++index) {
+        DiskDirectoryEntry entry;
+        DiskStatus status = disk_read_directory_entry(drive, index, &entry);
+        if (status != DISK_STATUS_OK) {
+            return 0xFFU;
+        }
+
+        if (!cpm_directory_entry_matches(&state, &entry)) {
+            continue;
+        }
+
+        uint8_t new_raw[32];
+        memcpy(new_raw, entry.raw, sizeof(new_raw));
+
+        if (set_read_only) {
+            new_raw[9] |= 0x80U;
+        } else {
+            new_raw[9] &= 0x7FU;
+        }
+
+        status = disk_write_directory_entry(drive, index, new_raw);
+        if (status != DISK_STATUS_OK) {
+            return 0xFFU;
+        }
+
+        updated = true;
+    }
+
+    if (!updated) {
+        return 0xFFU;
+    }
+
+    uint8_t updated_attr = memory_read8(emu, (uint16_t)(fcb_address + 9U));
+    if (set_read_only) {
+        updated_attr |= 0x80U;
+    } else {
+        updated_attr &= 0x7FU;
+    }
+    memory_write8(emu, (uint16_t)(fcb_address + 9U), updated_attr);
+
+    cpm_reset_directory_search(emu);
+    return 0x00U;
+}
+
 static uint8_t cpm_bdos_set_dma(Emulator *emu, uint16_t address)
 {
     emu->dma_address = address;
@@ -1113,6 +1187,25 @@ static void cpm_bdos_read_line(Emulator *emu, uint16_t address)
     memory_write8(emu, (uint16_t)(offset + count), '\r');
 }
 
+static uint8_t cpm_bdos_reader_input(Emulator *emu)
+{
+    if (emu == NULL) {
+        return 0x1AU;
+    }
+
+    FILE *stream = (emu->reader_fp != NULL) ? emu->reader_fp : stdin;
+    if (stream == NULL) {
+        return 0x1AU;
+    }
+
+    int ch = fgetc(stream);
+    if (ch == EOF) {
+        return 0x1AU;
+    }
+
+    return (uint8_t)ch;
+}
+
 static void cpm_bdos_output_punch(uint8_t value)
 {
     fputc((int)value, stdout);
@@ -1288,6 +1381,13 @@ static int handle_bdos_call(Emulator *emu)
         store_return = false;
         break;
     }
+    case 0x03: {
+        uint8_t value = cpm_bdos_reader_input(emu);
+        emu->cpu.a = value;
+        emu->cpu.l = value;
+        store_return = false;
+        break;
+    }
     case 0x02:
         putchar((int)emu->cpu.e);
         fflush(stdout);
@@ -1373,6 +1473,9 @@ static int handle_bdos_call(Emulator *emu)
         return_code = (uint8_t)(mask & 0xFFU);
         break;
     }
+    case 0x1E:
+        return_code = cpm_bdos_set_file_attributes(emu, de);
+        break;
     case 0x21:
         return_code = cpm_bdos_read_random(emu, de);
         break;
@@ -3635,6 +3738,8 @@ static void emulator_init(Emulator *emu)
     emu->bios_table_next = BIOS_TABLE_REGION_END;
     emu->default_drive = 0U;
     cpm_reset_directory_search(emu);
+    emu->reader_fp = NULL;
+    emu->reader_close = false;
 }
 
 static void emulator_unmount_disks(Emulator *emu)
@@ -3648,6 +3753,12 @@ static void emulator_unmount_disks(Emulator *emu)
             disk_unmount(&emu->disks[i]);
         }
     }
+
+    if (emu->reader_fp != NULL && emu->reader_close) {
+        fclose(emu->reader_fp);
+    }
+    emu->reader_fp = NULL;
+    emu->reader_close = false;
 }
 
 static int hex_value(char ch)
@@ -3867,8 +3978,9 @@ static void usage(const char *prog)
 {
     fprintf(stderr,
             "Usage: %s [--cycles N] [--disk DRIVE:path] [--disk-geom DRIVE:spt:ssize[:tracks]]\n"
-            "           [--disk-a path] [--load addr:file] [--load-hex path]\n"
-            "           [--entry addr] [--no-cpm-traps] [program.bin]\n",
+            "           [--disk-xlt DRIVE:map] [--disk-a path] [--reader path]\n"
+            "           [--load addr:file] [--load-hex path] [--entry addr]\n"
+            "           [--no-cpm-traps] [program.bin]\n",
             prog);
 }
 
@@ -4029,6 +4141,7 @@ static bool parse_disk_geometry_spec(const char *spec, int *drive_index, DiskGeo
     geometry->sectors_per_track = sectors_per_track;
     geometry->sector_size = sector_size;
     geometry->track_count = track_count;
+    geometry->translation_table_owned = false;
     *drive_index = index;
     return true;
 }
@@ -4139,6 +4252,7 @@ int main(int argc, char **argv)
         disk_geometries[i].sector_size = DISK_DEFAULT_SECTOR_BYTES;
         disk_geometries[i].translation_table = NULL;
         disk_geometries[i].translation_table_length = 0U;
+        disk_geometries[i].translation_table_owned = false;
         disk_geometries[i].allow_header = true;
         disk_translation_tables[i] = NULL;
         disk_translation_lengths[i] = 0U;
@@ -4193,6 +4307,29 @@ int main(int argc, char **argv)
             free(disk_translation_tables[drive_index]);
             disk_translation_tables[drive_index] = table;
             disk_translation_lengths[drive_index] = length;
+        } else if (strcmp(argv[i], "--reader") == 0) {
+            if (i + 1 >= argc) {
+                usage(argv[0]);
+                return EXIT_FAILURE;
+            }
+            const char *path = argv[++i];
+            if (emu.reader_fp != NULL && emu.reader_close) {
+                fclose(emu.reader_fp);
+                emu.reader_fp = NULL;
+                emu.reader_close = false;
+            }
+            if (strcmp(path, "-") == 0) {
+                emu.reader_fp = stdin;
+                emu.reader_close = false;
+            } else {
+                FILE *reader = fopen(path, "rb");
+                if (reader == NULL) {
+                    fprintf(stderr, "Failed to open reader file '%s': %s\n", path, strerror(errno));
+                    return EXIT_FAILURE;
+                }
+                emu.reader_fp = reader;
+                emu.reader_close = true;
+            }
         } else if (strncmp(argv[i], "--disk-", 7) == 0 && argv[i][7] != '\0' && argv[i][8] == '\0') {
             int drive_index = parse_drive_letter_char(argv[i][7]);
             if (drive_index < 0) {
