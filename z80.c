@@ -15,6 +15,7 @@
 #define CP_M_BDOS_ENTRY 0x0005U
 #define CP_M_DEFAULT_DMA 0x0080U
 #define CP_M_MAX_OPEN_FILES 16
+#define CP_M_MAX_DISK_DRIVES 16
 
 typedef struct {
     uint8_t a;
@@ -55,7 +56,7 @@ typedef struct {
 typedef struct {
     Z80 cpu;
     uint8_t memory[MEMORY_SIZE];
-    DiskDrive disk_a;
+    DiskDrive disks[CP_M_MAX_DISK_DRIVES];
     uint16_t dma_address;
     uint8_t bios_selected_disk;
     uint16_t bios_track;
@@ -557,8 +558,8 @@ static void cpm_bdos_read_line(Emulator *emu, uint16_t address)
 
 static uint8_t cpm_bios_select_disk(Emulator *emu, uint8_t disk)
 {
-    if (disk == 0U && disk_is_mounted(&emu->disk_a)) {
-        emu->bios_selected_disk = 0U;
+    if (disk < CP_M_MAX_DISK_DRIVES && disk_is_mounted(&emu->disks[disk])) {
+        emu->bios_selected_disk = disk;
         emu->bios_track = 0U;
         emu->bios_sector = 1U;
         return 0x01U;
@@ -570,35 +571,49 @@ static uint8_t cpm_bios_select_disk(Emulator *emu, uint8_t disk)
 
 static uint8_t cpm_bios_transfer_sector(Emulator *emu, bool write)
 {
-    if (emu->bios_selected_disk != 0U || !disk_is_mounted(&emu->disk_a)) {
-        return 0x01U;
+    if (emu->bios_selected_disk >= CP_M_MAX_DISK_DRIVES) {
+        return (uint8_t)DISK_STATUS_NOT_READY;
+    }
+
+    DiskDrive *drive = &emu->disks[emu->bios_selected_disk];
+    if (!disk_is_mounted(drive)) {
+        return (uint8_t)DISK_STATUS_NOT_READY;
     }
 
     if (emu->bios_sector == 0U) {
-        return 0x01U;
+        return (uint8_t)DISK_STATUS_BAD_ADDRESS;
+    }
+
+    size_t sector_size = disk_sector_size(drive);
+    if (sector_size == 0U) {
+        return (uint8_t)DISK_STATUS_NOT_READY;
     }
 
     uint16_t dma = emu->dma_address;
-    uint8_t buffer[DISK_SECTOR_BYTES];
-
-    if (write) {
-        for (size_t i = 0; i < sizeof(buffer); ++i) {
-            buffer[i] = memory_read8(emu, (uint16_t)(dma + (uint16_t)i));
-        }
-        size_t sector_index = (size_t)(emu->bios_sector - 1U);
-        return (disk_write_sector(&emu->disk_a, emu->bios_track, sector_index, buffer, sizeof(buffer)) == 0) ? 0x00U : 0x01U;
+    uint8_t *buffer = (uint8_t *)malloc(sector_size);
+    if (buffer == NULL) {
+        return (uint8_t)DISK_STATUS_IO_ERROR;
     }
 
     size_t sector_index = (size_t)(emu->bios_sector - 1U);
-    if (disk_read_sector(&emu->disk_a, emu->bios_track, sector_index, buffer, sizeof(buffer)) != 0) {
-        return 0x01U;
+    DiskStatus status;
+
+    if (write) {
+        for (size_t i = 0; i < sector_size; ++i) {
+            buffer[i] = memory_read8(emu, (uint16_t)(dma + (uint16_t)i));
+        }
+        status = disk_write_sector(drive, emu->bios_track, sector_index, buffer, sector_size);
+    } else {
+        status = disk_read_sector(drive, emu->bios_track, sector_index, buffer, sector_size);
+        if (status == DISK_STATUS_OK) {
+            for (size_t i = 0; i < sector_size; ++i) {
+                memory_write8(emu, (uint16_t)(dma + (uint16_t)i), buffer[i]);
+            }
+        }
     }
 
-    for (size_t i = 0; i < sizeof(buffer); ++i) {
-        memory_write8(emu, (uint16_t)(dma + (uint16_t)i), buffer[i]);
-    }
-
-    return 0x00U;
+    free(buffer);
+    return (uint8_t)status;
 }
 
 static int handle_bios_call(Emulator *emu)
@@ -2982,6 +2997,19 @@ static void emulator_init(Emulator *emu)
     emu->trap_cpm_calls = true;
 }
 
+static void emulator_unmount_disks(Emulator *emu)
+{
+    if (emu == NULL) {
+        return;
+    }
+
+    for (size_t i = 0; i < CP_M_MAX_DISK_DRIVES; ++i) {
+        if (disk_is_mounted(&emu->disks[i])) {
+            disk_unmount(&emu->disks[i]);
+        }
+    }
+}
+
 static int hex_value(char ch)
 {
     if (ch >= '0' && ch <= '9') {
@@ -3198,7 +3226,8 @@ static size_t load_binary_file(Emulator *emu, const char *path, uint16_t address
 static void usage(const char *prog)
 {
     fprintf(stderr,
-            "Usage: %s [--cycles N] [--disk-a path] [--load addr:file] [--load-hex path]\n"
+            "Usage: %s [--cycles N] [--disk DRIVE:path] [--disk-geom DRIVE:spt:ssize[:tracks]]\n"
+            "           [--disk-a path] [--load addr:file] [--load-hex path]\n"
             "           [--entry addr] [--no-cpm-traps] [program.bin]\n",
             prog);
 }
@@ -3226,17 +3255,159 @@ static bool parse_uint16(const char *text, uint16_t *out)
     return true;
 }
 
+static bool parse_size_t_value(const char *text, size_t *out)
+{
+    if (text == NULL) {
+        return false;
+    }
+
+    char *end = NULL;
+    errno = 0;
+    unsigned long parsed = strtoul(text, &end, 0);
+    if (errno != 0 || text[0] == '\0' || (end != NULL && *end != '\0')) {
+        return false;
+    }
+
+    *out = (size_t)parsed;
+    return true;
+}
+
+static int parse_drive_letter_char(char ch)
+{
+    if (ch >= 'a' && ch <= 'z') {
+        ch = (char)(ch - ('a' - 'A'));
+    }
+
+    if (ch < 'A' || ch >= 'A' + CP_M_MAX_DISK_DRIVES) {
+        return -1;
+    }
+
+    return ch - 'A';
+}
+
+static int parse_drive_letter_token(const char *text)
+{
+    if (text == NULL || text[0] == '\0' || text[1] != '\0') {
+        return -1;
+    }
+
+    return parse_drive_letter_char(text[0]);
+}
+
+static bool parse_disk_image_spec(const char *spec, int *drive_index, const char **path_out)
+{
+    if (spec == NULL || drive_index == NULL || path_out == NULL) {
+        return false;
+    }
+
+    const char *colon = strchr(spec, ':');
+    if (colon == NULL || colon == spec || colon[1] == '\0') {
+        return false;
+    }
+
+    if (colon != spec + 1) {
+        return false;
+    }
+
+    int index = parse_drive_letter_char(spec[0]);
+    if (index < 0) {
+        return false;
+    }
+
+    *drive_index = index;
+    *path_out = colon + 1;
+    return true;
+}
+
+static bool parse_disk_geometry_spec(const char *spec, int *drive_index, DiskGeometry *geometry)
+{
+    if (spec == NULL || drive_index == NULL || geometry == NULL) {
+        return false;
+    }
+
+    size_t len = strlen(spec);
+    if (len == 0U || len >= 128U) {
+        return false;
+    }
+
+    char buffer[128];
+    memcpy(buffer, spec, len + 1U);
+
+    char *tokens[4];
+    size_t token_count = 0U;
+    char *cursor = buffer;
+
+    while (true) {
+        if (token_count >= 4U) {
+            return false;
+        }
+
+        tokens[token_count++] = cursor;
+        char *colon = strchr(cursor, ':');
+        if (colon == NULL) {
+            break;
+        }
+
+        *colon = '\0';
+        cursor = colon + 1;
+        if (*cursor == '\0') {
+            return false;
+        }
+    }
+
+    if (token_count < 3U || token_count > 4U) {
+        return false;
+    }
+
+    int index = parse_drive_letter_token(tokens[0]);
+    if (index < 0) {
+        return false;
+    }
+
+    size_t sectors_per_track;
+    size_t sector_size;
+    size_t track_count = 0U;
+
+    if (!parse_size_t_value(tokens[1], &sectors_per_track) || sectors_per_track == 0U) {
+        return false;
+    }
+
+    if (!parse_size_t_value(tokens[2], &sector_size) || sector_size == 0U) {
+        return false;
+    }
+
+    if (token_count == 4U) {
+        if (!parse_size_t_value(tokens[3], &track_count)) {
+            return false;
+        }
+    }
+
+    geometry->sectors_per_track = sectors_per_track;
+    geometry->sector_size = sector_size;
+    geometry->track_count = track_count;
+    *drive_index = index;
+    return true;
+}
+
 int main(int argc, char **argv)
 {
     Emulator emu;
     emulator_init(&emu);
 
     const char *program_path = NULL;
-    const char *disk_path = NULL;
     uint64_t max_cycles = DEFAULT_MAX_CYCLES;
     uint16_t entry_point = CP_M_LOAD_ADDRESS;
     bool entry_specified = false;
     bool memory_loaded = false;
+
+    const char *disk_paths[CP_M_MAX_DISK_DRIVES];
+    DiskGeometry disk_geometries[CP_M_MAX_DISK_DRIVES];
+    for (size_t i = 0; i < CP_M_MAX_DISK_DRIVES; ++i) {
+        disk_paths[i] = NULL;
+        disk_geometries[i].track_count = 0U;
+        disk_geometries[i].sectors_per_track = DISK_DEFAULT_SECTORS_PER_TRACK;
+        disk_geometries[i].sector_size = DISK_DEFAULT_SECTOR_BYTES;
+    }
 
     for (int i = 1; i < argc; ++i) {
         if (strcmp(argv[i], "--cycles") == 0) {
@@ -3245,12 +3416,43 @@ int main(int argc, char **argv)
                 return EXIT_FAILURE;
             }
             max_cycles = parse_cycles(argv[++i]);
-        } else if (strcmp(argv[i], "--disk-a") == 0) {
+        } else if (strcmp(argv[i], "--disk") == 0) {
             if (i + 1 >= argc) {
                 usage(argv[0]);
                 return EXIT_FAILURE;
             }
-            disk_path = argv[++i];
+            const char *spec = argv[++i];
+            int drive_index;
+            const char *path;
+            if (!parse_disk_image_spec(spec, &drive_index, &path)) {
+                fprintf(stderr, "Invalid --disk argument '%s'\n", spec);
+                return EXIT_FAILURE;
+            }
+            disk_paths[drive_index] = path;
+        } else if (strcmp(argv[i], "--disk-geom") == 0) {
+            if (i + 1 >= argc) {
+                usage(argv[0]);
+                return EXIT_FAILURE;
+            }
+            const char *spec = argv[++i];
+            DiskGeometry geom;
+            int drive_index;
+            if (!parse_disk_geometry_spec(spec, &drive_index, &geom)) {
+                fprintf(stderr, "Invalid --disk-geom argument '%s'\n", spec);
+                return EXIT_FAILURE;
+            }
+            disk_geometries[drive_index] = geom;
+        } else if (strncmp(argv[i], "--disk-", 7) == 0 && argv[i][7] != '\0' && argv[i][8] == '\0') {
+            int drive_index = parse_drive_letter_char(argv[i][7]);
+            if (drive_index < 0) {
+                fprintf(stderr, "Unknown option '%s'\n", argv[i]);
+                return EXIT_FAILURE;
+            }
+            if (i + 1 >= argc) {
+                usage(argv[0]);
+                return EXIT_FAILURE;
+            }
+            disk_paths[drive_index] = argv[++i];
         } else if (strcmp(argv[i], "--load") == 0) {
             if (i + 1 >= argc) {
                 usage(argv[0]);
@@ -3318,20 +3520,21 @@ int main(int argc, char **argv)
         }
     }
 
-    if (disk_path != NULL) {
-        if (disk_mount(&emu.disk_a, disk_path, 26U, 128U) != 0) {
-            fprintf(stderr, "Failed to mount disk image '%s'\n", disk_path);
-            return EXIT_FAILURE;
+    for (size_t i = 0; i < CP_M_MAX_DISK_DRIVES; ++i) {
+        if (disk_paths[i] != NULL) {
+            if (disk_mount(&emu.disks[i], disk_paths[i], &disk_geometries[i]) != 0) {
+                fprintf(stderr, "Failed to mount disk image '%s' for drive %c\n", disk_paths[i], (int)('A' + i));
+                emulator_unmount_disks(&emu);
+                return EXIT_FAILURE;
+            }
         }
     }
 
     if (program_path != NULL) {
         size_t loaded = load_binary_file(&emu, program_path, CP_M_LOAD_ADDRESS);
         if (loaded == 0U) {
-            if (disk_is_mounted(&emu.disk_a)) {
-                disk_unmount(&emu.disk_a);
-            }
             fprintf(stderr, "No bytes loaded from '%s'\n", program_path);
+            emulator_unmount_disks(&emu);
             return EXIT_FAILURE;
         }
         memory_loaded = true;
@@ -3342,9 +3545,7 @@ int main(int argc, char **argv)
 
     if (!memory_loaded) {
         usage(argv[0]);
-        if (disk_is_mounted(&emu.disk_a)) {
-            disk_unmount(&emu.disk_a);
-        }
+        emulator_unmount_disks(&emu);
         return EXIT_FAILURE;
     }
 
@@ -3359,9 +3560,7 @@ int main(int argc, char **argv)
 
     cpm_close_all_files(&emu);
 
-    if (disk_is_mounted(&emu.disk_a)) {
-        disk_unmount(&emu.disk_a);
-    }
+    emulator_unmount_disks(&emu);
 
     return EXIT_SUCCESS;
 }
