@@ -4799,11 +4799,29 @@ int main(int argc, char **argv)
     emu.cpu.pc = entry_point;
 
     uint64_t cycles = 0ULL;
-    while (!emu.cpu.halted && (max_cycles == 0ULL || cycles < max_cycles)) {
+    bool cycle_limit_reached = false;
+    while (!emu.cpu.halted) {
+        if (max_cycles != 0ULL && cycles >= max_cycles) {
+            cycle_limit_reached = true;
+            break;
+        }
+
         cycles += (uint64_t)z80_step(&emu);
     }
 
-    printf("Execution halted after %" PRIu64 " cycles at PC=0x%04X\n", cycles, emu.cpu.pc);
+    if (max_cycles != 0ULL && cycles > max_cycles) {
+        cycles = max_cycles;
+        cycle_limit_reached = true;
+    }
+
+    if (cycle_limit_reached) {
+        printf(
+            "Execution halted after %" PRIu64 " cycles (cycle limit reached) at PC=0x%04X\n",
+            cycles,
+            emu.cpu.pc);
+    } else {
+        printf("Execution halted after %" PRIu64 " cycles at PC=0x%04X\n", cycles, emu.cpu.pc);
+    }
 
     cpm_close_all_files(&emu);
 
