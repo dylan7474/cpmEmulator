@@ -450,6 +450,20 @@ static bool bios_initialise_drive_tables(Emulator *emu)
                 memory_write16(emu, (uint16_t)(dpb_addr + 11U), dpb->cks);
                 memory_write16(emu, (uint16_t)(dpb_addr + 13U), dpb->off);
 
+                size_t xlt_length = 0U;
+                const uint8_t *xlt_data = disk_translation_table(drive, &xlt_length);
+                uint16_t xlt_addr = 0U;
+                if (xlt_data != NULL && xlt_length > 0U) {
+                    xlt_addr = bios_allocate(emu, xlt_length, 2U);
+                    if (xlt_addr == 0U) {
+                        return false;
+                    }
+
+                    for (size_t j = 0U; j < xlt_length; ++j) {
+                        memory_write8(emu, (uint16_t)(xlt_addr + (uint16_t)j), (uint8_t)(xlt_data[j] + 1U));
+                    }
+                }
+
                 size_t dirbuf_bytes = BIOS_DIRBUF_BYTES;
                 if (drive->geometry.sector_size > dirbuf_bytes) {
                     dirbuf_bytes = drive->geometry.sector_size;
@@ -466,6 +480,13 @@ static bool bios_initialise_drive_tables(Emulator *emu)
                     alv_addr = bios_allocate(emu, alv_bytes, 2U);
                     if (alv_addr == 0U) {
                         return false;
+                    }
+
+                    const uint8_t *alv_data = disk_allocation_vector(drive);
+                    if (alv_data != NULL) {
+                        for (size_t j = 0U; j < alv_bytes; ++j) {
+                            memory_write8(emu, (uint16_t)(alv_addr + (uint16_t)j), alv_data[j]);
+                        }
                     }
                 }
 
@@ -484,7 +505,7 @@ static bool bios_initialise_drive_tables(Emulator *emu)
                 }
 
                 uint16_t scratch_addr = (uint16_t)(dph_addr + 12U);
-                memory_write16(emu, dph_addr + 0U, 0x0000U);
+                memory_write16(emu, dph_addr + 0U, xlt_addr);
                 memory_write16(emu, dph_addr + 2U, scratch_addr);
                 memory_write16(emu, dph_addr + 4U, dirbuf_addr);
                 memory_write16(emu, dph_addr + 6U, dpb_addr);
@@ -934,6 +955,25 @@ static uint8_t cpm_bios_transfer_sector(Emulator *emu, bool write)
             buffer[i] = memory_read8(emu, (uint16_t)(dma + (uint16_t)i));
         }
         status = disk_write_sector(drive, emu->bios_track, sector_index, buffer, sector_size);
+        if (status == DISK_STATUS_OK) {
+            size_t alv_bytes = disk_allocation_vector_bytes(drive);
+            if (alv_bytes > 0U) {
+                uint16_t dph = emu->bios_dph_addresses[emu->bios_selected_disk];
+                if (dph != 0U) {
+                    uint16_t alv_addr = memory_read16(emu, (uint16_t)(dph + 10U));
+                    if (alv_addr != 0U) {
+                        uint8_t *shadow = (uint8_t *)malloc(alv_bytes);
+                        if (shadow != NULL) {
+                            for (size_t i = 0; i < alv_bytes; ++i) {
+                                shadow[i] = memory_read8(emu, (uint16_t)(alv_addr + (uint16_t)i));
+                            }
+                            disk_update_allocation_vector(drive, shadow, alv_bytes);
+                            free(shadow);
+                        }
+                    }
+                }
+            }
+        }
     } else {
         status = disk_read_sector(drive, emu->bios_track, sector_index, buffer, sector_size);
         if (status == DISK_STATUS_OK) {
@@ -3665,6 +3705,9 @@ static bool parse_disk_geometry_spec(const char *spec, int *drive_index, DiskGeo
         return false;
     }
 
+    geometry->translation_table = NULL;
+    geometry->translation_table_length = 0U;
+
     size_t len = strlen(spec);
     if (len == 0U || len >= 128U) {
         return false;
@@ -3729,6 +3772,90 @@ static bool parse_disk_geometry_spec(const char *spec, int *drive_index, DiskGeo
     return true;
 }
 
+static bool parse_disk_translation_spec(const char *spec, int *drive_index, uint8_t **table_out, size_t *length_out)
+{
+    if (spec == NULL || drive_index == NULL || table_out == NULL || length_out == NULL) {
+        return false;
+    }
+
+    const char *colon = strchr(spec, ':');
+    if (colon == NULL || colon == spec || colon[1] == '\0') {
+        return false;
+    }
+
+    if (colon != spec + 1) {
+        return false;
+    }
+
+    int index = parse_drive_letter_char(spec[0]);
+    if (index < 0) {
+        return false;
+    }
+
+    const char *list = colon + 1;
+    size_t list_len = strlen(list);
+    if (list_len == 0U || list_len >= 512U) {
+        return false;
+    }
+
+    size_t entry_count = 1U;
+    for (const char *p = list; *p != '\0'; ++p) {
+        if (*p == ',') {
+            ++entry_count;
+        }
+    }
+
+    uint8_t *table = (uint8_t *)malloc(entry_count);
+    if (table == NULL) {
+        return false;
+    }
+
+    char *mutable = (char *)malloc(list_len + 1U);
+    if (mutable == NULL) {
+        free(table);
+        return false;
+    }
+    memcpy(mutable, list, list_len + 1U);
+
+    size_t parsed = 0U;
+    char *token = mutable;
+    while (token != NULL) {
+        char *next = strchr(token, ',');
+        if (next != NULL) {
+            *next = '\0';
+        }
+
+        size_t value;
+        if (!parse_size_t_value(token, &value) || value == 0U || value > 256U) {
+            free(table);
+            free(mutable);
+            return false;
+        }
+
+        if (parsed >= entry_count) {
+            free(table);
+            free(mutable);
+            return false;
+        }
+
+        table[parsed++] = (uint8_t)(value - 1U);
+
+        token = (next != NULL) ? (next + 1) : NULL;
+    }
+
+    free(mutable);
+
+    if (parsed == 0U) {
+        free(table);
+        return false;
+    }
+
+    *drive_index = index;
+    *table_out = table;
+    *length_out = parsed;
+    return true;
+}
+
 int main(int argc, char **argv)
 {
     Emulator emu;
@@ -3742,11 +3869,17 @@ int main(int argc, char **argv)
 
     const char *disk_paths[CP_M_MAX_DISK_DRIVES];
     DiskGeometry disk_geometries[CP_M_MAX_DISK_DRIVES];
+    uint8_t *disk_translation_tables[CP_M_MAX_DISK_DRIVES];
+    size_t disk_translation_lengths[CP_M_MAX_DISK_DRIVES];
     for (size_t i = 0; i < CP_M_MAX_DISK_DRIVES; ++i) {
         disk_paths[i] = NULL;
         disk_geometries[i].track_count = 0U;
         disk_geometries[i].sectors_per_track = DISK_DEFAULT_SECTORS_PER_TRACK;
         disk_geometries[i].sector_size = DISK_DEFAULT_SECTOR_BYTES;
+        disk_geometries[i].translation_table = NULL;
+        disk_geometries[i].translation_table_length = 0U;
+        disk_translation_tables[i] = NULL;
+        disk_translation_lengths[i] = 0U;
     }
 
     for (int i = 1; i < argc; ++i) {
@@ -3782,6 +3915,22 @@ int main(int argc, char **argv)
                 return EXIT_FAILURE;
             }
             disk_geometries[drive_index] = geom;
+        } else if (strcmp(argv[i], "--disk-xlt") == 0) {
+            if (i + 1 >= argc) {
+                usage(argv[0]);
+                return EXIT_FAILURE;
+            }
+            const char *spec = argv[++i];
+            int drive_index;
+            uint8_t *table;
+            size_t length;
+            if (!parse_disk_translation_spec(spec, &drive_index, &table, &length)) {
+                fprintf(stderr, "Invalid --disk-xlt argument '%s'\n", spec);
+                return EXIT_FAILURE;
+            }
+            free(disk_translation_tables[drive_index]);
+            disk_translation_tables[drive_index] = table;
+            disk_translation_lengths[drive_index] = length;
         } else if (strncmp(argv[i], "--disk-", 7) == 0 && argv[i][7] != '\0' && argv[i][8] == '\0') {
             int drive_index = parse_drive_letter_char(argv[i][7]);
             if (drive_index < 0) {
@@ -3861,13 +4010,27 @@ int main(int argc, char **argv)
     }
 
     for (size_t i = 0; i < CP_M_MAX_DISK_DRIVES; ++i) {
+        disk_geometries[i].translation_table = disk_translation_tables[i];
+        disk_geometries[i].translation_table_length = disk_translation_lengths[i];
+    }
+
+    for (size_t i = 0; i < CP_M_MAX_DISK_DRIVES; ++i) {
         if (disk_paths[i] != NULL) {
             if (disk_mount(&emu.disks[i], disk_paths[i], &disk_geometries[i]) != 0) {
                 fprintf(stderr, "Failed to mount disk image '%s' for drive %c\n", disk_paths[i], (int)('A' + i));
                 emulator_unmount_disks(&emu);
+                for (size_t j = 0; j < CP_M_MAX_DISK_DRIVES; ++j) {
+                    free(disk_translation_tables[j]);
+                }
                 return EXIT_FAILURE;
             }
         }
+    }
+
+    for (size_t i = 0; i < CP_M_MAX_DISK_DRIVES; ++i) {
+        free(disk_translation_tables[i]);
+        disk_geometries[i].translation_table = NULL;
+        disk_geometries[i].translation_table_length = 0U;
     }
 
     if (!bios_initialise_drive_tables(&emu)) {

@@ -13,6 +13,8 @@ typedef struct {
     size_t track_count;
     size_t sectors_per_track;
     size_t sector_size;
+    const uint8_t *translation_table;
+    size_t translation_table_length;
 } DiskGeometry;
 
 typedef enum {
@@ -67,6 +69,12 @@ typedef struct {
     size_t directory_offset;
     size_t directory_entries;
     size_t allocation_vector_bytes;
+    size_t directory_metadata_bytes;
+    uint8_t *directory_metadata;
+    uint8_t *allocation_vector_data;
+    bool allocation_vector_from_bios;
+    uint8_t *translation_table;
+    size_t translation_table_entries;
     uint8_t *cache;
     size_t cache_track;
     size_t cache_sector;
@@ -81,8 +89,11 @@ bool disk_is_mounted(const DiskDrive *drive);
 const DiskParameterBlock *disk_parameter_block(const DiskDrive *drive);
 size_t disk_directory_entry_count(const DiskDrive *drive);
 size_t disk_allocation_vector_bytes(const DiskDrive *drive);
+const uint8_t *disk_allocation_vector(const DiskDrive *drive);
+const uint8_t *disk_translation_table(const DiskDrive *drive, size_t *length);
 DiskStatus disk_read_directory_entry(DiskDrive *drive, size_t index, DiskDirectoryEntry *entry);
 void disk_invalidate_cache(DiskDrive *drive);
+void disk_update_allocation_vector(DiskDrive *drive, const uint8_t *data, size_t length);
 
 static inline size_t disk_sector_size(const DiskDrive *drive)
 {

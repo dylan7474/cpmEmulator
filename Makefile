@@ -17,10 +17,13 @@ LDFLAGS ?=
 
 all: $(TARGET)
 
-.PHONY: example test cpm-system-test
+.PHONY: example test cpm-system-test integration-test
 example: $(BINARIES)
 
-test: cpm-system-test
+test: integration-test cpm-system-test
+
+integration-test: $(TARGET)
+	$(PYTHON) -m unittest tests.test_integration
 
 cpm-system-test: $(TARGET)
 	./scripts/run_cpm_system_image_test.sh
@@ -34,4 +37,4 @@ $(TARGET): $(SRCS)
 clean:
 	rm -f $(TARGET) $(BINARIES)
 
-.PHONY: all clean example test cpm-system-test
+.PHONY: all clean example test cpm-system-test integration-test

@@ -7,7 +7,7 @@ The current state includes:
 
 - A CPU core that implements the full 8080 instruction set along with the Z80 rotate/bit (`CB`) and block transfer/compare (`ED`) groups required by CP/M system binaries, including recent additions such as `NEG`, `RETN`/`RETI`, interrupt mode selection (`IM n`), register transfers with `I`/`R`, the decimal rotate helpers `RRD`/`RLD`, and comprehensive IX/IY-prefixed arithmetic, load, and block instructions.
 - A flat 64 KiB memory map suitable for early CP/M programs.
-- A configurable disk subsystem with multi-drive support wired into BIOS trap handlers. Each mounted image tracks per-drive geometry, exposes CP/M-compatible drive tables and disk parameter headers for `SELDSK`, caches recently accessed sectors, parses directory entries, and reports detailed status codes so CP/M filesystem routines can react to I/O faults while the full FDC emulation evolves.
+- A configurable disk subsystem with multi-drive support wired into BIOS trap handlers. Each mounted image tracks per-drive geometry, exposes CP/M-compatible drive tables, sector translation tables, and disk parameter headers for `SELDSK`, caches recently accessed sectors, persists allocation vector updates alongside directory metadata, and reports detailed status codes so CP/M filesystem routines can react to I/O faults while the full FDC emulation evolves.
 - CP/M-style BIOS warm boot and BDOS entry points that translate console and file calls into host operations so simple programs can interact with the environment.
 - BDOS trampolines covering sequential file I/O as well as directory search helpers (`SEARCH FIRST`/`SEARCH NEXT`) so console utilities can enumerate the mounted disk images without custom host shims.
 
@@ -65,7 +65,7 @@ Run the regression suite to ensure the CP/M system exercise and sample transient
 make test
 ```
 
-The harness first assembles the example binaries and then boots a curated CP/M 2.2 supervisor image with the emulator running in "no traps" mode. Successful runs show the `Hello from CP/M!` greeting, demonstrating that the command console trampolines are still wired correctly and that the expanded Z80 `ED` and IX/IY-prefixed helpers behave as expected in both a transient program and the supervisor stack itself.
+The harness first invokes a Python integration test that assembles `examples/hello.asm` on the fly, runs the resulting binary under the emulator, and asserts on the captured console output so the recent `ED`-prefixed flag fixes stay covered. It then boots a curated CP/M 2.2 supervisor image with the emulator running in "no traps" mode. Successful runs show the `Hello from CP/M!` greeting, demonstrating that the command console trampolines are still wired correctly and that the expanded Z80 `ED` and IX/IY-prefixed helpers behave as expected in both a transient program and the supervisor stack itself.
 
 After validating the supervisor image, the regression mounts a generated single-track diskette and runs `examples/bios_disk.bin`. That transient program issues BIOS `SELDSK`, `SETTRK`, `SETSEC`, `SETDMA`, and `READ` calls, confirming that the host-side FDC abstraction can service sector reads through the CP/M BIOS entry point. The BIOS shims now surface explicit `DISK_STATUS_*` return codes, so the program can distinguish "not ready" from "bad address" failures while echoing the sector payload through BDOS function 9.
 
@@ -74,6 +74,7 @@ Useful command-line options:
 - `--cycles N` – Limit execution to `N` T-states before halting automatically (default: 1,000,000).
 - `--disk DRIVE:path` – Mount a raw disk image on CP/M drive letter `DRIVE` (for example, `--disk B:disks/work.img`). The legacy shorthand `--disk-a` is still accepted for convenience.
 - `--disk-geom DRIVE:spt:ssize[:tracks]` – Override the sectors per track, sector size in bytes, and optional track count before mounting a drive. Geometry defaults to 26×128-byte sectors when unspecified.
+- `--disk-xlt DRIVE:map` – Provide a comma-separated list of 1-based sector numbers describing the BIOS translation order for each track (for example, `--disk-xlt A:1,5,9,13,17,21,25,2,6,...`).
 - `--load addr:file` – Copy an additional binary into memory at `addr` (for example, to preload a ROM or BIOS image). This flag
   may be repeated.
 - `--load-hex path` – Ingest an Intel HEX file at the addresses encoded in the records, which is convenient for CP/M system
@@ -89,8 +90,8 @@ Because most peripheral behaviours and a handful of less common opcodes are stil
 To validate the IX/IY-prefixed instruction paths against real system software, the test suite stores base64-encoded CP/M 2.2 supervisor images sourced from the [z80pack](https://github.com/udo-munk/z80pack) reconstruction. The helper script invoked by `make test` decodes the CCP/BDOS bundle (`cpm.bin.base64`) and BIOS stub (`bios.bin.base64`) into temporary binaries, maps them at `0xDC00` and `0xFA00`, disables the host BDOS/BIOS shims, and executes the machine for 500,000 T-states. When the emulator completes without reporting unimplemented opcodes, the IX/IY-prefixed execution paths have been exercised against the full CP/M supervisor stack. Mount a disk image with `--disk A:path` to extend the experiment to filesystem and console integration as new device emulation features land.
 
 ## Next steps
-- Persist allocation vector updates and directory metadata after BDOS write operations so cached geometry remains authoritative when programs modify the filesystem.
-- Surface BIOS sector translation tables to accommodate skewed physical layouts while keeping the logical CP/M directory order stable.
-- Replace the manual smoke test with an automated integration test that assembles the example program, runs it under the emulator, and asserts on the captured console output to prevent regressions in flag handling for recently added ED-prefixed opcodes.
+- Implement BDOS random record read/write helpers so programs that rely on extent sequencing can share disk images with the host-backed file API.
+- Add regression coverage for skewed disk layouts by mounting an image that uses a non-trivial translation table and verifying directory enumeration still matches CP/M expectations.
+- Surface disk write-protect status to BDOS callers so utilities can distinguish between read-only media and I/O failures.
 
 Contributions that expand opcode coverage, improve testing, or add CP/M-compatible peripherals are welcome.
