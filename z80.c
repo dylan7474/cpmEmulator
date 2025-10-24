@@ -3380,7 +3380,14 @@ static void handle_out(Emulator *emu, uint8_t port, uint8_t value)
 
 static uint8_t handle_in(Emulator *emu, uint8_t port)
 {
-    (void)emu;
+    if (emu == NULL) {
+        return 0x00U;
+    }
+
+    if (port == 0x01U) {
+        return cpm_bdos_console_status(emu);
+    }
+
     (void)port;
     return 0x00U;
 }

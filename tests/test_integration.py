@@ -610,6 +610,67 @@ class ConsoleStatusTest(unittest.TestCase):
         self.assertIn("READY", ready_result.stdout)
 
 
+class NoTrapConsoleStatusTest(unittest.TestCase):
+    def test_console_status_port_reports_idle_and_ready(self) -> None:
+        _build_emulator()
+
+        assembly_lines = [
+            "org 0x0100",
+            "start:",
+            "    db 0xDB, 0x01",
+            "    out 3",
+            "    db 0x76",
+        ]
+
+        program_bytes = assemble_source_lines(assembly_lines)
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            binary_path = Path(tmpdir) / "console_status_port.bin"
+            binary_path.write_bytes(program_bytes)
+
+            idle_capture = Path(tmpdir) / "idle_status.dat"
+            ready_capture = Path(tmpdir) / "ready_status.dat"
+
+            idle_result = subprocess.run(
+                [
+                    str(REPO_ROOT / "z80"),
+                    "--no-cpm-traps",
+                    "--punch-out",
+                    str(idle_capture),
+                    str(binary_path),
+                ],
+                cwd=REPO_ROOT,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                check=False,
+            )
+
+            ready_result = subprocess.run(
+                [
+                    str(REPO_ROOT / "z80"),
+                    "--no-cpm-traps",
+                    "--punch-out",
+                    str(ready_capture),
+                    str(binary_path),
+                ],
+                cwd=REPO_ROOT,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                input="X",
+                check=False,
+            )
+
+            idle_data = idle_capture.read_bytes()
+            ready_data = ready_capture.read_bytes()
+
+        self.assertEqual(idle_result.returncode, 0, msg=f"Idle status run failed:\n{idle_result.stdout}")
+        self.assertEqual(ready_result.returncode, 0, msg=f"Ready status run failed:\n{ready_result.stdout}")
+        self.assertEqual(idle_data, b"\x00")
+        self.assertEqual(ready_data, b"\xFF")
+
+
 class NoTrapDeviceCaptureTest(unittest.TestCase):
     def test_bios_ports_capture_spool_without_traps(self) -> None:
         _build_emulator()
