@@ -1,2 +1,3 @@
 z80
 examples/hello.bin
+third_party/cpm22/*.bin
