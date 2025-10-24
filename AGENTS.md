@@ -7,3 +7,4 @@
 - Call out any newly supported Z80 prefixes or opcode families in both commit messages and documentation so follow-up tasks can focus on validation.
 - Shell scripts must use `#!/usr/bin/env bash` and start with `set -euo pipefail`.
 - Run `make` before committing changes that affect the emulator core.
+- The CP/M regression mounts a generated disk image via `examples/bios_disk.bin`; keep the BIOS trap semantics compatible with that program when changing disk geometry or trap handlers.

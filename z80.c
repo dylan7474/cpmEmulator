@@ -57,6 +57,9 @@ typedef struct {
     uint8_t memory[MEMORY_SIZE];
     DiskDrive disk_a;
     uint16_t dma_address;
+    uint8_t bios_selected_disk;
+    uint16_t bios_track;
+    uint16_t bios_sector;
     bool trap_cpm_calls;
     CpmFileHandle files[CP_M_MAX_OPEN_FILES];
 } Emulator;
@@ -552,9 +555,104 @@ static void cpm_bdos_read_line(Emulator *emu, uint16_t address)
     memory_write8(emu, (uint16_t)(offset + count), '\r');
 }
 
+static uint8_t cpm_bios_select_disk(Emulator *emu, uint8_t disk)
+{
+    if (disk == 0U && disk_is_mounted(&emu->disk_a)) {
+        emu->bios_selected_disk = 0U;
+        emu->bios_track = 0U;
+        emu->bios_sector = 1U;
+        return 0x01U;
+    }
+
+    emu->bios_selected_disk = 0xFFU;
+    return 0x00U;
+}
+
+static uint8_t cpm_bios_transfer_sector(Emulator *emu, bool write)
+{
+    if (emu->bios_selected_disk != 0U || !disk_is_mounted(&emu->disk_a)) {
+        return 0x01U;
+    }
+
+    if (emu->bios_sector == 0U) {
+        return 0x01U;
+    }
+
+    uint16_t dma = emu->dma_address;
+    uint8_t buffer[DISK_SECTOR_BYTES];
+
+    if (write) {
+        for (size_t i = 0; i < sizeof(buffer); ++i) {
+            buffer[i] = memory_read8(emu, (uint16_t)(dma + (uint16_t)i));
+        }
+        size_t sector_index = (size_t)(emu->bios_sector - 1U);
+        return (disk_write_sector(&emu->disk_a, emu->bios_track, sector_index, buffer, sizeof(buffer)) == 0) ? 0x00U : 0x01U;
+    }
+
+    size_t sector_index = (size_t)(emu->bios_sector - 1U);
+    if (disk_read_sector(&emu->disk_a, emu->bios_track, sector_index, buffer, sizeof(buffer)) != 0) {
+        return 0x01U;
+    }
+
+    for (size_t i = 0; i < sizeof(buffer); ++i) {
+        memory_write8(emu, (uint16_t)(dma + (uint16_t)i), buffer[i]);
+    }
+
+    return 0x00U;
+}
+
 static int handle_bios_call(Emulator *emu)
 {
-    emu->cpu.halted = true;
+    uint8_t function = emu->cpu.c;
+    uint8_t status = 0x00U;
+
+    switch (function) {
+    case 0x00:
+        emu->cpu.halted = true;
+        break;
+    case 0x08:
+        emu->bios_track = 0U;
+        emu->bios_sector = 1U;
+        break;
+    case 0x09: {
+        uint8_t disk = emu->cpu.e;
+        uint8_t result = cpm_bios_select_disk(emu, disk);
+        z80_set_hl(&emu->cpu, result != 0U ? 0x0001U : 0x0000U);
+        break;
+    }
+    case 0x0A:
+        emu->bios_track = z80_de(&emu->cpu);
+        break;
+    case 0x0B:
+        emu->bios_sector = z80_de(&emu->cpu);
+        break;
+    case 0x0C:
+        emu->dma_address = z80_de(&emu->cpu);
+        break;
+    case 0x0D:
+        status = cpm_bios_transfer_sector(emu, false);
+        emu->cpu.a = status;
+        emu->cpu.l = status;
+        break;
+    case 0x0E:
+        status = cpm_bios_transfer_sector(emu, true);
+        emu->cpu.a = status;
+        emu->cpu.l = status;
+        break;
+    case 0x0F:
+        emu->cpu.a = 0x00U;
+        emu->cpu.l = 0x00U;
+        break;
+    case 0x10: {
+        uint16_t address = z80_de(&emu->cpu);
+        z80_set_hl(&emu->cpu, address);
+        break;
+    }
+    default:
+        break;
+    }
+
+    cpm_return_from_call(emu);
     return 11;
 }
 
@@ -2878,6 +2976,9 @@ static void emulator_init(Emulator *emu)
     memset(emu, 0, sizeof(*emu));
     z80_reset(&emu->cpu);
     emu->dma_address = CP_M_DEFAULT_DMA;
+    emu->bios_selected_disk = 0xFFU;
+    emu->bios_track = 0U;
+    emu->bios_sector = 1U;
     emu->trap_cpm_calls = true;
 }
 
