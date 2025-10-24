@@ -19,6 +19,8 @@ typedef struct {
     bool has_default_dma;
     bool translation_table_owned;
     bool allow_header;
+    size_t directory_buffer_bytes;
+    bool has_directory_buffer;
 } DiskGeometry;
 
 typedef enum {
@@ -68,6 +70,8 @@ typedef struct {
     uint16_t default_dma_address;
     bool has_default_dma;
     size_t data_offset;
+    size_t directory_buffer_bytes;
+    bool has_directory_buffer;
     DiskParameterBlock parameter_block;
     bool parameter_block_valid;
     size_t records_per_track;
