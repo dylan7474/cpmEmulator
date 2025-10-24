@@ -9,7 +9,7 @@ The current state includes:
 - A flat 64 KiB memory map suitable for early CP/M programs.
 - A configurable disk subsystem with multi-drive support wired into BIOS trap handlers. Each mounted image tracks per-drive geometry, exposes CP/M-compatible drive tables, sector translation tables, and disk parameter headers for `SELDSK`, caches recently accessed sectors, persists allocation vector updates alongside directory metadata, reports detailed status codes so CP/M filesystem routines can react to I/O faults while the full FDC emulation evolves, and can infer geometry directly from optional CPMI headers without an explicit `--disk-geom` override.
 - CP/M-style BIOS warm boot and BDOS entry points that translate console and file calls into host operations so simple programs can interact with the environment.
-- BDOS trampolines covering sequential and random record file I/O alongside directory search helpers (`SEARCH FIRST`/`SEARCH NEXT`) so console utilities can enumerate the mounted disk images without custom host shims while remaining compatible with extent sequencing.
+- BDOS trampolines covering sequential and random record file I/O alongside directory search helpers (`SEARCH FIRST`/`SEARCH NEXT`) so console utilities can enumerate the mounted disk images without custom host shims while remaining compatible with extent sequencing, and a reader-device shim so paper-tape oriented programs can ingest host data without custom BIOS patches.
 - Console device shims that drive the standard console, punch, and list streams so host tooling can observe printer or paper-tape output without custom BIOS patches.
 
 Expect to extend the instruction coverage and peripheral behaviour as CP/M functionality is implemented.
@@ -58,7 +58,7 @@ The BDOS shim prints the greeting stored in the sample program and then returns 
 
 When one or more disk images are mounted, the emulator reserves a BIOS workspace near the top of memory so CP/M software can interrogate the host geometry without custom patches. The word stored at `0xF000` contains the pointer to the drive table, which in turn stores one disk parameter header (DPH) pointer per drive. The byte at `0xF002` reports how many of those entries correspond to mounted drives. Each DPH references a drive-specific disk parameter block (DPB), allocation vector, and scratch buffers. The layout matches the CP/M 2.2 conventions, so `SELDSK` returns the same DPH pointer and utilities can walk the table directly to discover the sector size, tracks-per-disk, and reserved-directory allocation for each image.
 
-Read-only host permissions now surface through both the BDOS read-only vector and individual directory entries, so CP/M utilities will display the `R/O` attribute and avoid attempting to reclaim allocation blocks on protected media.
+Read-only host permissions now surface through both the BDOS read-only vector and individual directory entries, so CP/M utilities will display the `R/O` attribute and avoid attempting to reclaim allocation blocks on protected media. Attribute updates performed from CP/M are written back into the directory metadata whenever BDOS writes succeed, keeping the on-disk flags synchronised across reboots.
 
 ## Testing
 
@@ -78,6 +78,7 @@ Useful command-line options:
 - `--disk DRIVE:path` – Mount a raw disk image on CP/M drive letter `DRIVE` (for example, `--disk B:disks/work.img`). The legacy shorthand `--disk-a` is still accepted for convenience.
 - `--disk-geom DRIVE:spt:ssize[:tracks]` – Override the sectors per track, sector size in bytes, and optional track count before mounting a drive. Geometry defaults to 26×128-byte sectors when unspecified.
 - `--disk-xlt DRIVE:map` – Provide a comma-separated list of 1-based sector numbers describing the BIOS translation order for each track (for example, `--disk-xlt A:1,5,9,13,17,21,25,2,6,...`).
+- `--reader path` – Supply bytes for the BDOS reader device from `path` (use `-` to read from standard input).
 - `--load addr:file` – Copy an additional binary into memory at `addr` (for example, to preload a ROM or BIOS image). This flag
   may be repeated.
 - `--load-hex path` – Ingest an Intel HEX file at the addresses encoded in the records, which is convenient for CP/M system
@@ -90,15 +91,15 @@ Because most peripheral behaviours and a handful of less common opcodes are stil
 
 ### CPMI disk headers
 
-When mounting images that begin with the 16-byte `CPMI` header, the emulator now extracts the encoded sector size, sectors per track, and optional track count automatically. The payload immediately following the header is treated as the first sector, so existing raw media remain compatible while curated images can embed geometry metadata for convenience.
+When mounting images that begin with the 16-byte `CPMI` header, the emulator now extracts the encoded sector size, sectors per track, and optional track count automatically. If the header's track-count field sets the high bit, the next four bytes contain the translation-table length followed by one byte per logical sector describing the BIOS skew order (using the familiar 1-based numbering). The payload immediately following the header (and optional table) is treated as the first sector, so existing raw media remain compatible while curated images can embed geometry and translation metadata for convenience.
 
 ### Exercising CP/M system images
 
 To validate the IX/IY-prefixed instruction paths against real system software, the test suite stores base64-encoded CP/M 2.2 supervisor images sourced from the [z80pack](https://github.com/udo-munk/z80pack) reconstruction. The helper script invoked by `make test` decodes the CCP/BDOS bundle (`cpm.bin.base64`) and BIOS stub (`bios.bin.base64`) into temporary binaries, maps them at `0xDC00` and `0xFA00`, disables the host BDOS/BIOS shims, and executes the machine for 500,000 T-states. When the emulator completes without reporting unimplemented opcodes, the IX/IY-prefixed execution paths have been exercised against the full CP/M supervisor stack. Mount a disk image with `--disk A:path` to extend the experiment to filesystem and console integration as new device emulation features land.
 
 ## Next steps
-- Add support for the BDOS reader device so paper-tape utilities can ingest host data without bespoke console shims.
-- Persist CP/M attribute updates back into disk directory metadata when host writes succeed so read-only flags remain synchronised across boots.
-- Extend CPMI header parsing to capture optional translation tables, eliminating the need for separate `--disk-xlt` overrides.
+- Expose the reader device through an automated regression so tape-ingest workflows stay covered as BDOS support expands.
+- Extend attribute handling to cover the system and archive bits and exercise the changes against common CP/M utilities.
+- Allow CPMI headers to encode per-drive default DMA addresses so BIOS table initialisation covers more disk profiles automatically.
 
 Contributions that expand opcode coverage, improve testing, or add CP/M-compatible peripherals are welcome.
