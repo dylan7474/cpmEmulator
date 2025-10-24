@@ -3,6 +3,9 @@ from __future__ import annotations
 import subprocess
 import tempfile
 import unittest
+import subprocess
+import tempfile
+import unittest
 from pathlib import Path
 
 
@@ -45,11 +48,16 @@ def _resolve_operand(token: str, labels: dict[str, int], origin: int) -> int:
     token = token.strip()
     if token in labels:
         return origin + labels[token]
+    for operator in ('+', '-'):
+        if operator in token:
+            left, right = token.split(operator, 1)
+            base = _resolve_operand(left, labels, origin)
+            offset = _resolve_operand(right, labels, 0)
+            return base + offset if operator == '+' else base - offset
     return int(token, 0)
 
 
-def assemble_hello(source_path: Path) -> bytes:
-    lines = source_path.read_text().splitlines()
+def assemble_source_lines(lines: list[str]) -> bytes:
     origin: int | None = None
     program_counter = 0
     labels: dict[str, int] = {}
@@ -96,6 +104,23 @@ def assemble_hello(source_path: Path) -> bytes:
             operand = tokens[2]
             instructions.append(('mvi', register, operand))
             program_counter += 2
+        elif directive == 'mov':
+            dest = tokens[1].rstrip(',').lower()
+            src = tokens[2].lower()
+            instructions.append(('mov', dest, src))
+            program_counter += 1
+        elif directive == 'lda':
+            operand = tokens[1]
+            instructions.append(('lda', operand))
+            program_counter += 3
+        elif directive == 'sta':
+            operand = tokens[1]
+            instructions.append(('sta', operand))
+            program_counter += 3
+        elif directive == 'inx':
+            register = tokens[1].lower()
+            instructions.append(('inx', register))
+            program_counter += 1
         elif directive == 'call':
             operand = tokens[1]
             instructions.append(('call', operand))
@@ -144,6 +169,40 @@ def assemble_hello(source_path: Path) -> bytes:
             value = int(operand, 0)
             output.append(opcode_map[register])
             output.append(value & 0xFF)
+        elif kind == 'mov':
+            _, dest, src = entry
+            register_codes = {
+                'b': 0,
+                'c': 1,
+                'd': 2,
+                'e': 3,
+                'h': 4,
+                'l': 5,
+                'm': 6,
+                'a': 7,
+            }
+            if dest not in register_codes or src not in register_codes:
+                raise ValueError(f"Unsupported MOV operands: {dest}, {src}")
+            opcode = 0x40 | (register_codes[dest] << 3) | register_codes[src]
+            output.append(opcode)
+        elif kind == 'lda':
+            _, operand = entry
+            value = _resolve_operand(operand, labels, origin)
+            output.append(0x3A)
+            output.append(value & 0xFF)
+            output.append((value >> 8) & 0xFF)
+        elif kind == 'sta':
+            _, operand = entry
+            value = _resolve_operand(operand, labels, origin)
+            output.append(0x32)
+            output.append(value & 0xFF)
+            output.append((value >> 8) & 0xFF)
+        elif kind == 'inx':
+            _, register = entry
+            opcode_map = {'b': 0x03, 'd': 0x13, 'h': 0x23, 'sp': 0x33}
+            if register not in opcode_map:
+                raise ValueError(f"Unsupported register pair for INX: {register}")
+            output.append(opcode_map[register])
         elif kind == 'call':
             _, operand = entry
             value = _resolve_operand(operand, labels, origin)
@@ -156,12 +215,29 @@ def assemble_hello(source_path: Path) -> bytes:
     return bytes(output)
 
 
+def assemble_source(path: Path) -> bytes:
+    return assemble_source_lines(path.read_text().splitlines())
+
+
+def _build_emulator() -> None:
+    subprocess.run(["make"], cwd=REPO_ROOT, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+
+
+def _format_db_lines(values: list[int]) -> list[str]:
+    lines: list[str] = []
+    for start in range(0, len(values), 16):
+        chunk = values[start:start + 16]
+        formatted = ", ".join(f"0x{value:02X}" for value in chunk)
+        lines.append(f"    db {formatted}")
+    return lines
+
+
 class HelloIntegrationTest(unittest.TestCase):
     def test_hello_program_runs_via_emulator(self) -> None:
-        subprocess.run(["make"], cwd=REPO_ROOT, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        _build_emulator()
 
         source_path = REPO_ROOT / "examples" / "hello.asm"
-        program_bytes = assemble_hello(source_path)
+        program_bytes = assemble_source(source_path)
 
         with tempfile.TemporaryDirectory() as tmpdir:
             binary_path = Path(tmpdir) / "hello.bin"
@@ -179,6 +255,194 @@ class HelloIntegrationTest(unittest.TestCase):
         self.assertEqual(result.returncode, 0, msg=f"Emulator exited with {result.returncode}:\n{result.stdout}")
         self.assertIn("Hello from CP/M!", result.stdout)
         self.assertIn("Execution halted", result.stdout)
+
+
+class RandomRecordIoTest(unittest.TestCase):
+    def test_random_record_io_round_trip(self) -> None:
+        _build_emulator()
+
+        block1 = [ord('T'), ord('E'), ord('S'), ord('T')] + [((i * 5) & 0xFF) for i in range(4, 128)]
+        block2 = [ord('N'), ord('E'), ord('X'), ord('T')] + [((i * 7 + 1) & 0xFF) for i in range(4, 128)]
+        read_buffer = [0x00] * 128
+
+        fcb_setup = []
+        fcb_setup.append("    mvi a, 0")
+        fcb_setup.append("    sta 0x005C")
+        for index, char in enumerate("RANDTEST"):
+            value = ord(char)
+            fcb_setup.append(f"    mvi a, 0x{value:02X}")
+            fcb_setup.append(f"    sta 0x{0x005D + index:04X}")
+        for index, char in enumerate("DAT"):
+            value = ord(char)
+            fcb_setup.append(f"    mvi a, 0x{value:02X}")
+            fcb_setup.append(f"    sta 0x{0x0065 + index:04X}")
+        for offset in (0x0068, 0x0069, 0x006A, 0x006B, 0x007C, 0x007D, 0x007E, 0x007F):
+            fcb_setup.append("    mvi a, 0")
+            fcb_setup.append(f"    sta 0x{offset:04X}")
+
+        reset_random = []
+        for offset in (0x0068, 0x0069, 0x006A, 0x006B, 0x007C, 0x007D, 0x007E, 0x007F):
+            reset_random.append("    mvi a, 0")
+            reset_random.append(f"    sta 0x{offset:04X}")
+
+        assembly_lines: list[str] = ["org 0x0100", "start:"]
+        assembly_lines.extend(fcb_setup)
+        assembly_lines.extend(
+            [
+                "    lxi d, 0x005C",
+                "    mvi c, 0x16",
+                "    call 0x0005",
+                "    lxi d, write_block1",
+                "    mvi c, 0x1A",
+                "    call 0x0005",
+                "    lxi d, 0x005C",
+                "    mvi c, 0x22",
+                "    call 0x0005",
+                "    lxi d, write_block2",
+                "    mvi c, 0x1A",
+                "    call 0x0005",
+                "    lxi d, 0x005C",
+                "    mvi c, 0x22",
+                "    call 0x0005",
+                "    lxi d, 0x005C",
+                "    mvi c, 0x10",
+                "    call 0x0005",
+                "    lxi d, 0x005C",
+                "    mvi c, 0x0F",
+                "    call 0x0005",
+            ]
+        )
+        assembly_lines.extend(reset_random)
+        assembly_lines.extend(
+            [
+                "    lxi d, 0x005C",
+                "    mvi c, 0x24",
+                "    call 0x0005",
+                "    lxi d, read_buffer",
+                "    mvi c, 0x1A",
+                "    call 0x0005",
+                "    lxi d, 0x005C",
+                "    mvi c, 0x21",
+                "    call 0x0005",
+                "    lda read_buffer",
+                "    mov e, a",
+                "    mvi c, 0x02",
+                "    call 0x0005",
+                "    lda read_buffer+1",
+                "    mov e, a",
+                "    mvi c, 0x02",
+                "    call 0x0005",
+                "    lda read_buffer+2",
+                "    mov e, a",
+                "    mvi c, 0x02",
+                "    call 0x0005",
+                "    lda read_buffer+3",
+                "    mov e, a",
+                "    mvi c, 0x02",
+                "    call 0x0005",
+                "    mvi e, 0x0D",
+                "    mvi c, 0x02",
+                "    call 0x0005",
+                "    mvi e, 0x0A",
+                "    mvi c, 0x02",
+                "    call 0x0005",
+                "    lxi d, 0x005C",
+                "    mvi c, 0x10",
+                "    call 0x0005",
+                "    mvi c, 0x00",
+                "    call 0x0005",
+            ]
+        )
+        assembly_lines.append("write_block1:")
+        assembly_lines.extend(_format_db_lines(block1))
+        assembly_lines.append("write_block2:")
+        assembly_lines.extend(_format_db_lines(block2))
+        assembly_lines.append("read_buffer:")
+        assembly_lines.extend(_format_db_lines(read_buffer))
+
+        program_bytes = assemble_source_lines(assembly_lines)
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            binary_path = Path(tmpdir) / "random_io.bin"
+            binary_path.write_bytes(program_bytes)
+
+            result = subprocess.run(
+                [str(REPO_ROOT / "z80"), str(binary_path)],
+                cwd=REPO_ROOT,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                check=False,
+            )
+
+        output_path = REPO_ROOT / "randtest.dat"
+        try:
+            self.assertEqual(result.returncode, 0, msg=f"Emulator exited with {result.returncode}:\n{result.stdout}")
+            self.assertIn("TEST", result.stdout)
+            self.assertTrue(output_path.exists(), "Expected host-backed file was not created")
+            data = output_path.read_bytes()
+            self.assertGreaterEqual(len(data), 256)
+            self.assertEqual(list(data[:128]), block1)
+            self.assertEqual(list(data[128:256]), block2)
+        finally:
+            if output_path.exists():
+                output_path.unlink()
+
+
+class DiskTranslationTableTest(unittest.TestCase):
+    def test_directory_enumeration_matches_translation(self) -> None:
+        translation = [(i * 5) % 26 for i in range(26)]
+        logical = bytearray([0xE5] * (26 * 128))
+
+        def write_entry(slot: int, name: str, ext: str) -> None:
+            offset = slot * 32
+            logical[offset] = 0x00
+            padded_name = name.upper().ljust(8)
+            padded_ext = ext.upper().ljust(3)
+            for index, char in enumerate(padded_name):
+                logical[offset + 1 + index] = ord(char)
+            for index, char in enumerate(padded_ext):
+                logical[offset + 9 + index] = ord(char)
+
+        write_entry(0, "alpha", "txt")
+        write_entry(1, "gamma", "bin")
+
+        disk_bytes = bytearray(len(logical))
+        for logical_sector in range(26):
+            physical = translation[logical_sector]
+            start = logical_sector * 128
+            disk_bytes[physical * 128:(physical + 1) * 128] = logical[start:start + 128]
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            image_path = Path(tmpdir) / "skewed.img"
+            image_path.write_bytes(disk_bytes)
+
+            binary_path = Path(tmpdir) / "disk_enum"
+            compile_cmd = [
+                "gcc",
+                "-std=c11",
+                "-Wall",
+                "-Wextra",
+                "-I.",
+                str(REPO_ROOT / "tests" / "disk_translation_test.c"),
+                str(REPO_ROOT / "disk.c"),
+                "-o",
+                str(binary_path),
+            ]
+            subprocess.run(compile_cmd, cwd=REPO_ROOT, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+
+            result = subprocess.run(
+                [str(binary_path), str(image_path)],
+                cwd=REPO_ROOT,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                check=False,
+            )
+
+        self.assertEqual(result.returncode, 0, msg=f"disk translation helper failed:\n{result.stdout}")
+        self.assertIn("ALPHA.TXT", result.stdout)
+        self.assertIn("GAMMA.BIN", result.stdout)
 
 
 if __name__ == "__main__":
