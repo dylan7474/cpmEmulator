@@ -281,6 +281,35 @@ def _format_db_lines(values: list[int]) -> list[str]:
     return lines
 
 
+def _build_port_spool_program(message: bytes) -> bytes:
+    program = bytearray()
+    message_offset = 0x0111
+
+    program.extend([
+        0x21,
+        message_offset & 0xFF,
+        (message_offset >> 8) & 0xFF,
+    ])
+    program.extend([
+        0x7E,
+        0xB7,
+        0xCA,
+        0x10,
+        0x01,
+        0xD3,
+        0x03,
+        0xD3,
+        0x05,
+        0x23,
+        0xC3,
+        0x03,
+        0x01,
+        0x76,
+    ])
+    program.extend(message + b"\x00")
+    return bytes(program)
+
+
 class HelloIntegrationTest(unittest.TestCase):
     def test_hello_program_runs_via_emulator(self) -> None:
         _build_emulator()
@@ -669,6 +698,47 @@ class NoTrapConsoleStatusTest(unittest.TestCase):
         self.assertEqual(ready_result.returncode, 0, msg=f"Ready status run failed:\n{ready_result.stdout}")
         self.assertEqual(idle_data, b"\x00")
         self.assertEqual(ready_data, b"\xFF")
+
+
+class SupervisorPunchListRegressionTest(unittest.TestCase):
+    def test_supervisor_port_spool_reaches_punch_and_list(self) -> None:
+        _build_emulator()
+
+        message = b"PIP SPOOL TEST\r\n"
+        program_bytes = _build_port_spool_program(message)
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            program_path = Path(tmpdir) / "pip_spool.bin"
+            program_path.write_bytes(program_bytes)
+            punch_path = Path(tmpdir) / "punch_capture.dat"
+            list_path = Path(tmpdir) / "list_capture.dat"
+
+            result = subprocess.run(
+                [
+                    str(REPO_ROOT / "z80"),
+                    "--no-cpm-traps",
+                    "--entry",
+                    "0x0100",
+                    "--load",
+                    f"0x0100:{program_path}",
+                    "--punch-out",
+                    str(punch_path),
+                    "--list-out",
+                    str(list_path),
+                ],
+                cwd=REPO_ROOT,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                check=False,
+            )
+
+            punch_bytes = punch_path.read_bytes()
+            list_bytes = list_path.read_bytes()
+
+        self.assertEqual(result.returncode, 0, msg=result.stdout)
+        self.assertEqual(punch_bytes, message)
+        self.assertEqual(list_bytes, message)
 
 
 class NoTrapDeviceCaptureTest(unittest.TestCase):
