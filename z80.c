@@ -1284,6 +1284,13 @@ static uint8_t cpm_bdos_search_directory(Emulator *emu, uint16_t fcb_address, bo
     return 0xFFU;
 }
 
+static void cpm_bios_console_output(Emulator *emu, uint8_t value)
+{
+    (void)emu;
+    putchar((int)value);
+    fflush(stdout);
+}
+
 static void cpm_bdos_output_string(Emulator *emu, uint16_t address)
 {
     for (;;) {
@@ -3364,6 +3371,11 @@ static void handle_out(Emulator *emu, uint8_t port, uint8_t value)
         return;
     }
 
+    if (port == 0x01U) {
+        cpm_bios_console_output(emu, value);
+        return;
+    }
+
     if (port == 0x03U) {
         cpm_bdos_output_punch(emu, value);
         return;
@@ -3385,6 +3397,19 @@ static uint8_t handle_in(Emulator *emu, uint8_t port)
     }
 
     if (port == 0x01U) {
+        if (cpm_bdos_console_status(emu) == 0x00U) {
+            return 0x00U;
+        }
+
+        int ch = getchar();
+        if (ch == EOF) {
+            clearerr(stdin);
+            return 0x00U;
+        }
+        return (uint8_t)ch;
+    }
+
+    if (port == 0x00U) {
         return cpm_bdos_console_status(emu);
     }
 
