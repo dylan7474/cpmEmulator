@@ -54,6 +54,37 @@ For the bundled sample program:
 
 The BDOS shim prints the greeting stored in the sample program and then returns to the host.
 
+### Launching an interactive CP/M console
+
+To experiment with a full CP/M environment instead of a transient program, boot the bundled CP/M 2.2 images and let the emulated BIOS handle console I/O. The quickest path is to reuse the regression helper that wires everything together:
+
+```bash
+./scripts/run_cpm_system_image_test.sh
+```
+
+The script decodes the CCP/BDOS and BIOS binaries stored under `third_party/cpm22/`, loads them at the same addresses used by the tests, disables the host BDOS and BIOS traps, and runs the machine long enough to reach the CP/M prompt. When the supervisor finishes booting you can issue standard commands such as `DIR` or `TYPE` against any mounted disk images.
+
+To wire up the console session manually, mimic the options used by the helper script. First decode the base64 resources into raw binaries (for example, `/tmp/cpm.bin` and `/tmp/bios.bin`), then launch the emulator with:
+
+```bash
+./z80 \
+  --no-cpm-traps \
+  --entry 0xFA00 \
+  --load 0xDC00:/tmp/cpm.bin \
+  --load 0xFA00:/tmp/bios.bin \
+  --disk A:path/to/disk.img \
+  --cycles 500000
+```
+
+Key flags:
+
+- `--no-cpm-traps` hands console and disk services back to the CP/M BIOS and BDOS so you see the native prompt.
+- `--entry 0xFA00` jumps into the BIOS warm-boot vector packaged with the supervisor image.
+- Each `--load` pair copies the decoded system binaries into the addresses expected by the supervisor.
+- Add `--disk` options to mount CP/M disk images that should appear as drives A:, B:, and so on.
+
+Once the machine reaches the CCP prompt, you can run any CP/M commands available on the mounted media.
+
 ### Inspecting BIOS disk tables
 
 When one or more disk images are mounted, the emulator reserves a BIOS workspace near the top of memory so CP/M software can interrogate the host geometry without custom patches. The word stored at `0xF000` contains the pointer to the drive table, which in turn stores one disk parameter header (DPH) pointer per drive. The byte at `0xF002` reports how many of those entries correspond to mounted drives. Each DPH references a drive-specific disk parameter block (DPB), allocation vector, and scratch buffers. The layout matches the CP/M 2.2 conventions, so `SELDSK` returns the same DPH pointer and utilities can walk the table directly to discover the sector size, tracks-per-disk, and reserved-directory allocation for each image.
