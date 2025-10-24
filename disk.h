@@ -15,6 +15,8 @@ typedef struct {
     size_t sector_size;
     const uint8_t *translation_table;
     size_t translation_table_length;
+    uint16_t default_dma_address;
+    bool has_default_dma;
     bool translation_table_owned;
     bool allow_header;
 } DiskGeometry;
@@ -63,6 +65,8 @@ typedef struct {
     size_t image_size;
     bool mounted;
     bool read_only;
+    uint16_t default_dma_address;
+    bool has_default_dma;
     size_t data_offset;
     DiskParameterBlock parameter_block;
     bool parameter_block_valid;

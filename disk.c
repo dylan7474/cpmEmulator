@@ -7,6 +7,8 @@
 
 #define DISK_HEADER_MAGIC "CPMI"
 #define DISK_HEADER_SIZE 16U
+#define DISK_HEADER_FLAG_TRANSLATION 0x80000000U
+#define DISK_HEADER_FLAG_DEFAULT_DMA 0x40000000U
 
 static DiskStatus disk_cache_ensure(DiskDrive *drive, size_t track, size_t sector);
 static void disk_parse_directory_entry_bytes(const uint8_t raw[32], DiskDirectoryEntry *entry);
@@ -49,8 +51,9 @@ static bool disk_try_apply_header(FILE *fp, DiskGeometry *geom, size_t file_size
     uint32_t track_count_raw = (uint32_t)header[12] | ((uint32_t)header[13] << 8) | ((uint32_t)header[14] << 16)
                                | ((uint32_t)header[15] << 24);
 
-    bool header_has_translation = (track_count_raw & 0x80000000U) != 0U;
-    track_count_raw &= 0x7FFFFFFFU;
+    bool header_has_translation = (track_count_raw & DISK_HEADER_FLAG_TRANSLATION) != 0U;
+    bool header_has_default_dma = (track_count_raw & DISK_HEADER_FLAG_DEFAULT_DMA) != 0U;
+    track_count_raw &= ~(DISK_HEADER_FLAG_TRANSLATION | DISK_HEADER_FLAG_DEFAULT_DMA);
 
     if (sector_size == 0U || sectors_per_track == 0U) {
         (void)fseek(fp, original, SEEK_SET);
@@ -64,6 +67,24 @@ static bool disk_try_apply_header(FILE *fp, DiskGeometry *geom, size_t file_size
     size_t offset = DISK_HEADER_SIZE;
     uint8_t *allocated_table = NULL;
     size_t translation_entries = 0U;
+
+    bool original_has_default_dma = geom->has_default_dma;
+    uint16_t original_default_dma = geom->default_dma_address;
+
+    if (header_has_default_dma) {
+        if (file_size < offset + 2U) {
+            goto fail;
+        }
+
+        uint8_t dma_bytes[2];
+        if (fread(dma_bytes, 1U, sizeof(dma_bytes), fp) != sizeof(dma_bytes)) {
+            goto fail;
+        }
+
+        geom->default_dma_address = (uint16_t)((uint16_t)dma_bytes[0] | ((uint16_t)dma_bytes[1] << 8));
+        geom->has_default_dma = true;
+        offset += sizeof(dma_bytes);
+    }
 
     if (header_has_translation) {
         if (file_size < DISK_HEADER_SIZE + 4U) {
@@ -137,6 +158,9 @@ fail:
         geom->translation_table_length = 0U;
         geom->translation_table_owned = false;
     }
+
+    geom->default_dma_address = original_default_dma;
+    geom->has_default_dma = original_has_default_dma;
 
     (void)fseek(fp, original, SEEK_SET);
     return false;
@@ -656,7 +680,7 @@ static void disk_parse_directory_entry_bytes(const uint8_t raw[32], DiskDirector
     }
 
     for (size_t i = 0U; i < 3U; ++i) {
-        uint8_t ch = raw[9U + i];
+        uint8_t ch = (uint8_t)(raw[9U + i] & 0x7FU);
         if (ch >= 'a' && ch <= 'z') {
             ch = (uint8_t)(ch - ('a' - 'A'));
         }
@@ -792,6 +816,8 @@ int disk_mount(DiskDrive *drive, const char *path, const DiskGeometry *geometry)
     drive->image_size = image_size;
     drive->mounted = true;
     drive->read_only = read_only;
+    drive->default_dma_address = geom.has_default_dma ? geom.default_dma_address : 0U;
+    drive->has_default_dma = geom.has_default_dma;
     drive->data_offset = data_offset;
     drive->cache = cache;
     drive->cache_valid = false;
@@ -978,6 +1004,8 @@ void disk_unmount(DiskDrive *drive)
     drive->image_size = 0U;
     drive->mounted = false;
     drive->read_only = false;
+    drive->default_dma_address = 0U;
+    drive->has_default_dma = false;
     drive->data_offset = 0U;
     disk_reset_metadata(drive);
     disk_invalidate_cache_internal(drive);
