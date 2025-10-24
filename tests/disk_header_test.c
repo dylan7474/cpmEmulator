@@ -76,6 +76,16 @@ int main(int argc, char **argv)
         ok = false;
     }
 
+    if (!drive.has_attribute_hints || (drive.attribute_flags & DISK_ATTRIBUTE_FLAG_READ_ONLY) == 0U) {
+        fprintf(stderr, "attribute hints missing read-only flag\n");
+        ok = false;
+    }
+
+    if (!drive.header_read_only || !drive.read_only) {
+        fprintf(stderr, "read-only hint was not applied to drive state\n");
+        ok = false;
+    }
+
     uint8_t *buffer = (uint8_t *)malloc(EXPECTED_SECTOR_SIZE);
     if (buffer == NULL) {
         fprintf(stderr, "Failed to allocate sector buffer\n");

@@ -8,6 +8,7 @@
 
 #define DISK_DEFAULT_SECTOR_BYTES 128U
 #define DISK_DEFAULT_SECTORS_PER_TRACK 26U
+#define DISK_ATTRIBUTE_FLAG_READ_ONLY 0x01U
 
 typedef struct {
     size_t track_count;
@@ -21,6 +22,8 @@ typedef struct {
     bool allow_header;
     size_t directory_buffer_bytes;
     bool has_directory_buffer;
+    uint8_t attribute_flags;
+    bool has_attribute_hints;
 } DiskGeometry;
 
 typedef enum {
@@ -67,11 +70,15 @@ typedef struct {
     size_t image_size;
     bool mounted;
     bool read_only;
+    bool host_read_only;
+    bool header_read_only;
     uint16_t default_dma_address;
     bool has_default_dma;
     size_t data_offset;
     size_t directory_buffer_bytes;
     bool has_directory_buffer;
+    uint8_t attribute_flags;
+    bool has_attribute_hints;
     DiskParameterBlock parameter_block;
     bool parameter_block_valid;
     size_t records_per_track;
