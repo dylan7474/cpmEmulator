@@ -16,6 +16,10 @@
 #define CP_M_DEFAULT_DMA 0x0080U
 #define CP_M_MAX_OPEN_FILES 16
 #define CP_M_MAX_DISK_DRIVES 16
+#define BIOS_TABLE_REGION_START 0xF000U
+#define BIOS_TABLE_REGION_END 0xFF00U
+#define BIOS_DPH_SCRATCH_BYTES 16U
+#define BIOS_DIRBUF_BYTES 128U
 
 typedef struct {
     uint8_t a;
@@ -54,6 +58,15 @@ typedef struct {
 } CpmFileHandle;
 
 typedef struct {
+    bool active;
+    uint8_t drive;
+    uint8_t user_number;
+    size_t next_index;
+    char filename_pattern[9];
+    char extension_pattern[4];
+} DirectorySearchState;
+
+typedef struct {
     Z80 cpu;
     uint8_t memory[MEMORY_SIZE];
     DiskDrive disks[CP_M_MAX_DISK_DRIVES];
@@ -63,6 +76,11 @@ typedef struct {
     uint16_t bios_sector;
     bool trap_cpm_calls;
     CpmFileHandle files[CP_M_MAX_OPEN_FILES];
+    uint16_t bios_dph_addresses[CP_M_MAX_DISK_DRIVES];
+    uint16_t bios_drive_table_address;
+    uint16_t bios_table_next;
+    uint8_t default_drive;
+    DirectorySearchState directory_search;
 } Emulator;
 
 static inline uint16_t z80_bc(const Z80 *cpu)
@@ -194,6 +212,39 @@ static inline void memory_write16(Emulator *emu, uint16_t address, uint16_t valu
 {
     emu->memory[address] = (uint8_t)(value & 0xFFU);
     emu->memory[(uint16_t)(address + 1U)] = (uint8_t)((value >> 8) & 0xFFU);
+}
+
+static uint16_t bios_allocate(Emulator *emu, size_t size, size_t alignment)
+{
+    if (emu == NULL || size == 0U) {
+        return 0U;
+    }
+
+    if (alignment == 0U) {
+        alignment = 1U;
+    }
+
+    uint16_t old_next = emu->bios_table_next;
+    if (old_next < BIOS_TABLE_REGION_START + size) {
+        return 0U;
+    }
+
+    uint16_t base = (uint16_t)(old_next - (uint16_t)size);
+    if (alignment > 1U) {
+        uint16_t mask = (uint16_t)(alignment - 1U);
+        base = (uint16_t)(base & (uint16_t)~mask);
+    }
+
+    if (base < BIOS_TABLE_REGION_START) {
+        return 0U;
+    }
+
+    emu->bios_table_next = base;
+    for (uint16_t addr = base; addr < old_next; ++addr) {
+        memory_write8(emu, addr, 0x00U);
+    }
+
+    return base;
 }
 
 static uint16_t cpm_pop16(Emulator *emu)
@@ -333,6 +384,135 @@ static void cpm_close_all_files(Emulator *emu)
             emu->files[i].fcb_address = 0U;
         }
     }
+}
+
+static void cpm_reset_directory_search(Emulator *emu)
+{
+    if (emu == NULL) {
+        return;
+    }
+
+    emu->directory_search.active = false;
+    emu->directory_search.drive = 0U;
+    emu->directory_search.user_number = 0xFFU;
+    emu->directory_search.next_index = 0U;
+    memset(emu->directory_search.filename_pattern, ' ', sizeof(emu->directory_search.filename_pattern));
+    memset(emu->directory_search.extension_pattern, ' ', sizeof(emu->directory_search.extension_pattern));
+    emu->directory_search.filename_pattern[8] = '\0';
+    emu->directory_search.extension_pattern[3] = '\0';
+}
+
+static bool bios_initialise_drive_tables(Emulator *emu)
+{
+    if (emu == NULL) {
+        return false;
+    }
+
+    emu->bios_table_next = BIOS_TABLE_REGION_END;
+    emu->bios_drive_table_address = 0U;
+    for (size_t i = 0U; i < CP_M_MAX_DISK_DRIVES; ++i) {
+        emu->bios_dph_addresses[i] = 0U;
+    }
+
+    cpm_reset_directory_search(emu);
+
+    size_t table_bytes = CP_M_MAX_DISK_DRIVES * sizeof(uint16_t);
+    if (table_bytes > 0U) {
+        uint16_t table_addr = bios_allocate(emu, table_bytes, 2U);
+        if (table_addr == 0U && CP_M_MAX_DISK_DRIVES != 0U) {
+            return false;
+        }
+        emu->bios_drive_table_address = table_addr;
+    }
+
+    bool default_set = false;
+    uint8_t drive_count = 0U;
+
+    for (size_t i = 0U; i < CP_M_MAX_DISK_DRIVES; ++i) {
+        DiskDrive *drive = &emu->disks[i];
+        uint16_t dph_addr = 0U;
+        if (disk_is_mounted(drive)) {
+            const DiskParameterBlock *dpb = disk_parameter_block(drive);
+            if (dpb != NULL) {
+                uint16_t dpb_addr = bios_allocate(emu, sizeof(*dpb), 2U);
+                if (dpb_addr == 0U) {
+                    return false;
+                }
+
+                memory_write16(emu, dpb_addr + 0U, dpb->spt);
+                memory_write8(emu, (uint16_t)(dpb_addr + 2U), dpb->bsh);
+                memory_write8(emu, (uint16_t)(dpb_addr + 3U), dpb->blm);
+                memory_write8(emu, (uint16_t)(dpb_addr + 4U), dpb->exm);
+                memory_write16(emu, (uint16_t)(dpb_addr + 5U), dpb->dsm);
+                memory_write16(emu, (uint16_t)(dpb_addr + 7U), dpb->drm);
+                memory_write8(emu, (uint16_t)(dpb_addr + 9U), dpb->al0);
+                memory_write8(emu, (uint16_t)(dpb_addr + 10U), dpb->al1);
+                memory_write16(emu, (uint16_t)(dpb_addr + 11U), dpb->cks);
+                memory_write16(emu, (uint16_t)(dpb_addr + 13U), dpb->off);
+
+                size_t dirbuf_bytes = BIOS_DIRBUF_BYTES;
+                if (drive->geometry.sector_size > dirbuf_bytes) {
+                    dirbuf_bytes = drive->geometry.sector_size;
+                }
+
+                uint16_t dirbuf_addr = bios_allocate(emu, dirbuf_bytes, 2U);
+                if (dirbuf_addr == 0U && dirbuf_bytes != 0U) {
+                    return false;
+                }
+
+                size_t alv_bytes = disk_allocation_vector_bytes(drive);
+                uint16_t alv_addr = 0U;
+                if (alv_bytes > 0U) {
+                    alv_addr = bios_allocate(emu, alv_bytes, 2U);
+                    if (alv_addr == 0U) {
+                        return false;
+                    }
+                }
+
+                uint16_t csv_addr = 0U;
+                if (dpb->cks != 0U) {
+                    csv_addr = bios_allocate(emu, dpb->cks, 2U);
+                    if (csv_addr == 0U) {
+                        return false;
+                    }
+                }
+
+                uint16_t dph_size = (uint16_t)(6U * sizeof(uint16_t) + BIOS_DPH_SCRATCH_BYTES);
+                dph_addr = bios_allocate(emu, dph_size, 2U);
+                if (dph_addr == 0U) {
+                    return false;
+                }
+
+                uint16_t scratch_addr = (uint16_t)(dph_addr + 12U);
+                memory_write16(emu, dph_addr + 0U, 0x0000U);
+                memory_write16(emu, dph_addr + 2U, scratch_addr);
+                memory_write16(emu, dph_addr + 4U, dirbuf_addr);
+                memory_write16(emu, dph_addr + 6U, dpb_addr);
+                memory_write16(emu, dph_addr + 8U, csv_addr);
+                memory_write16(emu, dph_addr + 10U, alv_addr);
+
+                if (!default_set) {
+                    emu->default_drive = (uint8_t)i;
+                    default_set = true;
+                }
+                ++drive_count;
+            }
+        }
+
+        emu->bios_dph_addresses[i] = dph_addr;
+        if (emu->bios_drive_table_address != 0U) {
+            memory_write16(emu, (uint16_t)(emu->bios_drive_table_address + (uint16_t)(i * 2U)), dph_addr);
+        }
+    }
+
+    if (!default_set) {
+        emu->default_drive = 0U;
+    }
+
+    memory_write16(emu, BIOS_TABLE_REGION_START, emu->bios_drive_table_address);
+    memory_write8(emu, (uint16_t)(BIOS_TABLE_REGION_START + 2U), drive_count);
+
+    return true;
 }
 
 static void cpm_advance_record(Emulator *emu, uint16_t fcb_address)
@@ -519,6 +699,149 @@ static uint8_t cpm_bdos_set_dma(Emulator *emu, uint16_t address)
     return 0x00U;
 }
 
+static bool cpm_prepare_directory_search(Emulator *emu, uint16_t fcb_address, DirectorySearchState *state)
+{
+    if (emu == NULL || state == NULL) {
+        return false;
+    }
+
+    uint8_t drive_code = memory_read8(emu, fcb_address);
+    uint8_t drive = 0U;
+
+    if (drive_code == 0U) {
+        drive = (emu->default_drive < CP_M_MAX_DISK_DRIVES) ? emu->default_drive : 0U;
+    } else if (drive_code <= CP_M_MAX_DISK_DRIVES) {
+        drive = (uint8_t)(drive_code - 1U);
+    } else {
+        return false;
+    }
+
+    if (drive >= CP_M_MAX_DISK_DRIVES) {
+        return false;
+    }
+
+    if (!disk_is_mounted(&emu->disks[drive])) {
+        return false;
+    }
+
+    state->drive = drive;
+    state->next_index = 0U;
+    state->active = true;
+    state->user_number = 0xFFU;
+
+    for (size_t i = 0U; i < 8U; ++i) {
+        char ch = (char)memory_read8(emu, (uint16_t)(fcb_address + 1U + i));
+        if (ch >= 'a' && ch <= 'z') {
+            ch = (char)(ch - ('a' - 'A'));
+        }
+        if (ch == '?') {
+            state->filename_pattern[i] = '?';
+        } else if (ch == 0x00 || ch == 0x20) {
+            state->filename_pattern[i] = ' ';
+        } else {
+            state->filename_pattern[i] = ch;
+        }
+    }
+    state->filename_pattern[8] = '\0';
+
+    for (size_t i = 0U; i < 3U; ++i) {
+        char ch = (char)memory_read8(emu, (uint16_t)(fcb_address + 9U + i));
+        if (ch >= 'a' && ch <= 'z') {
+            ch = (char)(ch - ('a' - 'A'));
+        }
+        if (ch == '?') {
+            state->extension_pattern[i] = '?';
+        } else if (ch == 0x00 || ch == 0x20) {
+            state->extension_pattern[i] = ' ';
+        } else {
+            state->extension_pattern[i] = ch;
+        }
+    }
+    state->extension_pattern[3] = '\0';
+
+    return true;
+}
+
+static bool cpm_directory_entry_matches(const DirectorySearchState *state, const DiskDirectoryEntry *entry)
+{
+    if (state == NULL || entry == NULL) {
+        return false;
+    }
+
+    if (entry->is_deleted || entry->is_empty) {
+        return false;
+    }
+
+    if (state->user_number != 0xFFU && entry->user_number != state->user_number) {
+        return false;
+    }
+
+    for (size_t i = 0U; i < 8U; ++i) {
+        char pattern = state->filename_pattern[i];
+        if (pattern == '\0') {
+            pattern = ' ';
+        }
+        char value = entry->filename_padded[i];
+        if (pattern != '?' && pattern != value) {
+            return false;
+        }
+    }
+
+    for (size_t i = 0U; i < 3U; ++i) {
+        char pattern = state->extension_pattern[i];
+        if (pattern == '\0') {
+            pattern = ' ';
+        }
+        char value = entry->extension_padded[i];
+        if (pattern != '?' && pattern != value) {
+            return false;
+        }
+    }
+
+    return true;
+}
+
+static uint8_t cpm_bdos_search_directory(Emulator *emu, uint16_t fcb_address, bool reset)
+{
+    if (reset || !emu->directory_search.active) {
+        if (!cpm_prepare_directory_search(emu, fcb_address, &emu->directory_search)) {
+            cpm_reset_directory_search(emu);
+            return 0xFFU;
+        }
+    }
+
+    DirectorySearchState *state = &emu->directory_search;
+    if (state->drive >= CP_M_MAX_DISK_DRIVES) {
+        cpm_reset_directory_search(emu);
+        return 0xFFU;
+    }
+
+    DiskDrive *drive = &emu->disks[state->drive];
+    size_t total = disk_directory_entry_count(drive);
+    for (size_t index = state->next_index; index < total; ++index) {
+        DiskDirectoryEntry entry;
+        DiskStatus status = disk_read_directory_entry(drive, index, &entry);
+        if (status != DISK_STATUS_OK) {
+            cpm_reset_directory_search(emu);
+            return 0xFFU;
+        }
+
+        if (!cpm_directory_entry_matches(state, &entry)) {
+            continue;
+        }
+
+        for (size_t i = 0U; i < sizeof(entry.raw); ++i) {
+            memory_write8(emu, (uint16_t)(emu->dma_address + (uint16_t)i), entry.raw[i]);
+        }
+
+        state->next_index = index + 1U;
+        return (uint8_t)(index & 0x7FU);
+    }
+
+    cpm_reset_directory_search(emu);
+    return 0xFFU;
+}
+
 static void cpm_bdos_output_string(Emulator *emu, uint16_t address)
 {
     for (;;) {
@@ -559,13 +882,21 @@ static void cpm_bdos_read_line(Emulator *emu, uint16_t address)
 static uint8_t cpm_bios_select_disk(Emulator *emu, uint8_t disk)
 {
     if (disk < CP_M_MAX_DISK_DRIVES && disk_is_mounted(&emu->disks[disk])) {
-        emu->bios_selected_disk = disk;
-        emu->bios_track = 0U;
-        emu->bios_sector = 1U;
-        return 0x01U;
+        uint16_t dph = emu->bios_dph_addresses[disk];
+        if (dph != 0U) {
+            emu->bios_selected_disk = disk;
+            emu->bios_track = 0U;
+            emu->bios_sector = 1U;
+            emu->default_drive = disk;
+            z80_set_hl(&emu->cpu, dph);
+            cpm_reset_directory_search(emu);
+            return 0x01U;
+        }
     }
 
     emu->bios_selected_disk = 0xFFU;
+    z80_set_hl(&emu->cpu, 0x0000U);
+    cpm_reset_directory_search(emu);
     return 0x00U;
 }
 
@@ -632,7 +963,7 @@ static int handle_bios_call(Emulator *emu)
     case 0x09: {
         uint8_t disk = emu->cpu.e;
         uint8_t result = cpm_bios_select_disk(emu, disk);
-        z80_set_hl(&emu->cpu, result != 0U ? 0x0001U : 0x0000U);
+        emu->cpu.a = result;
         break;
     }
     case 0x0A:
@@ -729,6 +1060,12 @@ static int handle_bdos_call(Emulator *emu)
         break;
     case 0x10:
         return_code = cpm_bdos_close_file(emu, de);
+        break;
+    case 0x11:
+        return_code = cpm_bdos_search_directory(emu, de, true);
+        break;
+    case 0x12:
+        return_code = cpm_bdos_search_directory(emu, de, false);
         break;
     case 0x13:
         return_code = cpm_bdos_delete_file(emu, de);
@@ -2995,6 +3332,9 @@ static void emulator_init(Emulator *emu)
     emu->bios_track = 0U;
     emu->bios_sector = 1U;
     emu->trap_cpm_calls = true;
+    emu->bios_table_next = BIOS_TABLE_REGION_END;
+    emu->default_drive = 0U;
+    cpm_reset_directory_search(emu);
 }
 
 static void emulator_unmount_disks(Emulator *emu)
@@ -3528,6 +3868,12 @@ int main(int argc, char **argv)
                 return EXIT_FAILURE;
             }
         }
+    }
+
+    if (!bios_initialise_drive_tables(&emu)) {
+        fprintf(stderr, "Failed to initialise CP/M BIOS drive tables\n");
+        emulator_unmount_disks(&emu);
+        return EXIT_FAILURE;
     }
 
     if (program_path != NULL) {

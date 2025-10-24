@@ -7,8 +7,9 @@ The current state includes:
 
 - A CPU core that implements the full 8080 instruction set along with the Z80 rotate/bit (`CB`) and block transfer/compare (`ED`) groups required by CP/M system binaries, including recent additions such as `NEG`, `RETN`/`RETI`, interrupt mode selection (`IM n`), register transfers with `I`/`R`, the decimal rotate helpers `RRD`/`RLD`, and comprehensive IX/IY-prefixed arithmetic, load, and block instructions.
 - A flat 64 KiB memory map suitable for early CP/M programs.
-- A configurable disk subsystem with multi-drive support wired into BIOS trap handlers. Each mounted image tracks per-drive geometry, respects read-only media, and reports detailed status codes so CP/M filesystem routines can react to I/O faults while the full FDC emulation evolves.
+- A configurable disk subsystem with multi-drive support wired into BIOS trap handlers. Each mounted image tracks per-drive geometry, exposes CP/M-compatible drive tables and disk parameter headers for `SELDSK`, caches recently accessed sectors, parses directory entries, and reports detailed status codes so CP/M filesystem routines can react to I/O faults while the full FDC emulation evolves.
 - CP/M-style BIOS warm boot and BDOS entry points that translate console and file calls into host operations so simple programs can interact with the environment.
+- BDOS trampolines covering sequential file I/O as well as directory search helpers (`SEARCH FIRST`/`SEARCH NEXT`) so console utilities can enumerate the mounted disk images without custom host shims.
 
 Expect to extend the instruction coverage and peripheral behaviour as CP/M functionality is implemented.
 
@@ -52,6 +53,10 @@ For the bundled sample program:
 
 The BDOS shim prints the greeting stored in the sample program and then returns to the host.
 
+### Inspecting BIOS disk tables
+
+When one or more disk images are mounted, the emulator reserves a BIOS workspace near the top of memory so CP/M software can interrogate the host geometry without custom patches. The word stored at `0xF000` contains the pointer to the drive table, which in turn stores one disk parameter header (DPH) pointer per drive. The byte at `0xF002` reports how many of those entries correspond to mounted drives. Each DPH references a drive-specific disk parameter block (DPB), allocation vector, and scratch buffers. The layout matches the CP/M 2.2 conventions, so `SELDSK` returns the same DPH pointer and utilities can walk the table directly to discover the sector size, tracks-per-disk, and reserved-directory allocation for each image.
+
 ## Testing
 
 Run the regression suite to ensure the CP/M system exercise and sample transient program both still behave:
@@ -84,8 +89,8 @@ Because most peripheral behaviours and a handful of less common opcodes are stil
 To validate the IX/IY-prefixed instruction paths against real system software, the test suite stores base64-encoded CP/M 2.2 supervisor images sourced from the [z80pack](https://github.com/udo-munk/z80pack) reconstruction. The helper script invoked by `make test` decodes the CCP/BDOS bundle (`cpm.bin.base64`) and BIOS stub (`bios.bin.base64`) into temporary binaries, maps them at `0xDC00` and `0xFA00`, disables the host BDOS/BIOS shims, and executes the machine for 500,000 T-states. When the emulator completes without reporting unimplemented opcodes, the IX/IY-prefixed execution paths have been exercised against the full CP/M supervisor stack. Mount a disk image with `--disk A:path` to extend the experiment to filesystem and console integration as new device emulation features land.
 
 ## Next steps
-- Surface BIOS disk parameter blocks and drive tables so CP/M can query host geometry without custom shims.
-- Flesh out disk access helpers with sector caching, directory parsing, and BDOS trampolines used by the console example.
+- Persist allocation vector updates and directory metadata after BDOS write operations so cached geometry remains authoritative when programs modify the filesystem.
+- Surface BIOS sector translation tables to accommodate skewed physical layouts while keeping the logical CP/M directory order stable.
 - Replace the manual smoke test with an automated integration test that assembles the example program, runs it under the emulator, and asserts on the captured console output to prevent regressions in flag handling for recently added ED-prefixed opcodes.
 
 Contributions that expand opcode coverage, improve testing, or add CP/M-compatible peripherals are welcome.
