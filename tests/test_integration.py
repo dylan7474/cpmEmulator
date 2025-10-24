@@ -646,7 +646,7 @@ class NoTrapConsoleStatusTest(unittest.TestCase):
         assembly_lines = [
             "org 0x0100",
             "start:",
-            "    db 0xDB, 0x01",
+            "    db 0xDB, 0x00",
             "    out 3",
             "    db 0x76",
         ]
