@@ -17,8 +17,13 @@ LDFLAGS ?=
 
 all: $(TARGET)
 
-.PHONY: example
+.PHONY: example test cpm-system-test
 example: $(EXAMPLE_BIN)
+
+test: cpm-system-test
+
+cpm-system-test: $(TARGET)
+	./scripts/run_cpm_system_image_test.sh
 
 $(EXAMPLE_BIN): $(EXAMPLE_HEX)
 	$(PYTHON) - <<'PY'
@@ -36,4 +41,4 @@ $(TARGET): $(SRCS)
 clean:
 	rm -f $(TARGET) $(EXAMPLE_BIN)
 
-.PHONY: all clean example
+.PHONY: all clean example test cpm-system-test

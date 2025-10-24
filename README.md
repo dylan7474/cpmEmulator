@@ -54,15 +54,13 @@ The BDOS shim prints the greeting stored in the sample program and then returns 
 
 ## Testing
 
-Until an automated harness is introduced, exercise the emulator manually with the bundled CP/M binary after every change:
+Run the regression suite to ensure the CP/M system exercise and sample transient program both still behave:
 
 ```
-make example
-./z80 examples/hello.bin
+make test
 ```
 
-Successful runs show the `Hello from CP/M!` greeting, demonstrating that the command console trampolines are still wired
-correctly and that the expanded Z80 `ED` and IX/IY-prefixed helpers behave as expected in a real program.
+The harness first assembles the `examples/hello.bin` payload and then boots a curated CP/M 2.2 supervisor image with the emulator running in "no traps" mode. Successful runs show the `Hello from CP/M!` greeting, demonstrating that the command console trampolines are still wired correctly and that the expanded Z80 `ED` and IX/IY-prefixed helpers behave as expected in both a transient program and the supervisor stack itself.
 
 Useful command-line options:
 
@@ -80,27 +78,10 @@ Because most peripheral behaviours and a handful of less common opcodes are stil
 
 ### Exercising CP/M system images
 
-To validate the IX/IY-prefixed instruction paths against real system software, load the canonical CP/M 2.2 components (CCP, BDOS, and BIOS) and execute them under the emulator. The binaries are available from the open-source reconstruction at [`brouhaha/cpm22`](https://github.com/brouhaha/cpm22). A typical workflow looks like:
-
-```bash
-mkdir -p third_party/cpm22
-curl -L https://raw.githubusercontent.com/brouhaha/cpm22/master/BUILD/ccp.hex -o third_party/cpm22/ccp.hex
-curl -L https://raw.githubusercontent.com/brouhaha/cpm22/master/BUILD/bdos.hex -o third_party/cpm22/bdos.hex
-curl -L https://raw.githubusercontent.com/brouhaha/cpm22/master/BUILD/bios.hex -o third_party/cpm22/bios.hex
-
-./z80 \
-  --no-cpm-traps \
-  --entry 0x0000 \
-  --load-hex third_party/cpm22/bios.hex \
-  --load-hex third_party/cpm22/bdos.hex \
-  --load-hex third_party/cpm22/ccp.hex \
-  --cycles 500000
-```
-
-The Intel HEX loader preserves the original placement encoded in each file, so no manual address bookkeeping is required. Booting with `--entry 0x0000` mimics the BIOS warm start vector while `--no-cpm-traps` ensures the resident CP/M code executes rather than the host-side shims. When the emulator completes without reporting unimplemented opcodes, the IX/IY-prefixed execution paths have been exercised against the full CP/M supervisor stack. Mount a disk image with `--disk-a` to extend the experiment to filesystem and console integration as new device emulation features land.
+To validate the IX/IY-prefixed instruction paths against real system software, the test suite stores base64-encoded CP/M 2.2 supervisor images sourced from the [z80pack](https://github.com/udo-munk/z80pack) reconstruction. The helper script invoked by `make test` decodes the CCP/BDOS bundle (`cpm.bin.base64`) and BIOS stub (`bios.bin.base64`) into temporary binaries, maps them at `0xDC00` and `0xFA00`, disables the host BDOS/BIOS shims, and executes the machine for 500,000 T-states. When the emulator completes without reporting unimplemented opcodes, the IX/IY-prefixed execution paths have been exercised against the full CP/M supervisor stack. Mount a disk image with `--disk-a` to extend the experiment to filesystem and console integration as new device emulation features land.
 
 ## Next steps
-- Automate the CP/M system image exercise so regressions in the IX/IY-prefixed helpers are caught in CI.
+- Extend the CP/M regression to cover disk I/O once the FDC abstraction matures so BIOS sector routines stay exercised.
 - Flesh out disk access helpers with sector caching, directory parsing, and optional disk geometry configuration, then wire them into the BDOS trampolines used by the console example.
 - Replace the manual smoke test with an automated integration test that assembles the example program, runs it under the emulator, and asserts on the captured console output to prevent regressions in flag handling for recently added ED-prefixed opcodes.
 
