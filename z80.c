@@ -1,3 +1,9 @@
+#if !defined(_WIN32)
+#ifndef _POSIX_C_SOURCE
+#define _POSIX_C_SOURCE 200809L
+#endif
+#endif
+
 #include <ctype.h>
 #include <errno.h>
 #include <inttypes.h>
@@ -6,6 +12,17 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#if defined(_WIN32)
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <windows.h>
+#include <io.h>
+#else
+#include <fcntl.h>
+#include <sys/select.h>
+#include <unistd.h>
+#endif
 
 #include "disk.h"
 
@@ -1323,6 +1340,89 @@ static uint8_t cpm_bdos_reader_input(Emulator *emu)
     return (uint8_t)ch;
 }
 
+static uint8_t cpm_bdos_console_status(Emulator *emu)
+{
+    (void)emu;
+#if defined(_WIN32)
+    HANDLE handle = GetStdHandle(STD_INPUT_HANDLE);
+    if (handle == NULL || handle == INVALID_HANDLE_VALUE) {
+        return 0x00U;
+    }
+
+    DWORD file_type = GetFileType(handle);
+    if (file_type == FILE_TYPE_CHAR) {
+        DWORD events = 0;
+        if (!GetNumberOfConsoleInputEvents(handle, &events) || events == 0U) {
+            return 0x00U;
+        }
+
+        INPUT_RECORD record;
+        DWORD read = 0;
+        if (!PeekConsoleInput(handle, &record, 1U, &read) || read == 0U) {
+            return 0x00U;
+        }
+
+        if (record.EventType == KEY_EVENT && record.Event.KeyEvent.bKeyDown
+            && record.Event.KeyEvent.uChar.AsciiChar != 0) {
+            return 0xFFU;
+        }
+
+        return 0x00U;
+    }
+
+    if (file_type == FILE_TYPE_PIPE || file_type == FILE_TYPE_DISK) {
+        DWORD available = 0;
+        if (PeekNamedPipe(handle, NULL, 0U, NULL, &available, NULL) && available > 0U) {
+            return 0xFFU;
+        }
+    }
+
+    return 0x00U;
+#else
+    int fd = fileno(stdin);
+    if (fd < 0) {
+        return 0x00U;
+    }
+
+    fd_set readfds;
+    FD_ZERO(&readfds);
+    FD_SET(fd, &readfds);
+
+    struct timeval tv;
+    tv.tv_sec = 0;
+    tv.tv_usec = 0;
+
+    int result = select(fd + 1, &readfds, NULL, NULL, &tv);
+    if (result <= 0 || !FD_ISSET(fd, &readfds)) {
+        return 0x00U;
+    }
+
+    int flags = fcntl(fd, F_GETFL);
+    int restore_flags = -1;
+    if (flags != -1 && (flags & O_NONBLOCK) == 0) {
+        if (fcntl(fd, F_SETFL, flags | O_NONBLOCK) == 0) {
+            restore_flags = flags;
+        }
+    }
+
+    int ch = getchar();
+    if (restore_flags != -1) {
+        (void)fcntl(fd, F_SETFL, restore_flags);
+    }
+
+    if (ch == EOF) {
+        clearerr(stdin);
+        return 0x00U;
+    }
+
+    if (ungetc(ch, stdin) == EOF) {
+        return 0x00U;
+    }
+
+    return 0xFFU;
+#endif
+}
+
 static void cpm_bdos_output_punch(Emulator *emu, uint8_t value)
 {
     FILE *stream = (emu != NULL && emu->punch_fp != NULL) ? emu->punch_fp : stdout;
@@ -1542,7 +1642,7 @@ static int handle_bdos_call(Emulator *emu)
         cpm_bdos_read_line(emu, de);
         break;
     case 0x0B:
-        return_code = 0x00U;
+        return_code = cpm_bdos_console_status(emu);
         break;
     case 0x0C:
         return_code = 0x22U;
@@ -1640,8 +1740,8 @@ static bool handle_cpm_entry(Emulator *emu, int *cycles)
     return false;
 }
 
-static void handle_out(uint8_t port, uint8_t value);
-static uint8_t handle_in(uint8_t port);
+static void handle_out(Emulator *emu, uint8_t port, uint8_t value);
+static uint8_t handle_in(Emulator *emu, uint8_t port);
 static uint8_t fetch8(Emulator *emu);
 static uint16_t fetch16(Emulator *emu);
 static int execute_ld_r_n(Emulator *emu, uint8_t opcode);
@@ -2940,7 +3040,7 @@ static int execute_ed_prefixed(Emulator *emu, IndexMode mode)
     case 0x78: {
         uint8_t *reg = decode_register(&emu->cpu, (opcode >> 3) & 0x07U);
         if (reg != NULL) {
-            uint8_t value = handle_in(emu->cpu.c);
+            uint8_t value = handle_in(emu, emu->cpu.c);
             *reg = value;
             set_flag(&emu->cpu, FLAG_S, (value & 0x80U) != 0U);
             set_flag(&emu->cpu, FLAG_Z, value == 0U);
@@ -2959,7 +3059,7 @@ static int execute_ed_prefixed(Emulator *emu, IndexMode mode)
     case 0x79: {
         uint8_t *reg = decode_register(&emu->cpu, (opcode >> 3) & 0x07U);
         uint8_t value = (reg != NULL) ? *reg : 0U;
-        handle_out(emu->cpu.c, value);
+        handle_out(emu, emu->cpu.c, value);
         return 12;
     }
     case 0x44:
@@ -3055,7 +3155,7 @@ static int execute_ed_prefixed(Emulator *emu, IndexMode mode)
         return 18;
     }
     case 0x70: {
-        uint8_t value = handle_in(emu->cpu.c);
+        uint8_t value = handle_in(emu, emu->cpu.c);
         set_flag(&emu->cpu, FLAG_S, (value & 0x80U) != 0U);
         set_flag(&emu->cpu, FLAG_Z, value == 0U);
         set_flag(&emu->cpu, FLAG_H, false);
@@ -3064,7 +3164,7 @@ static int execute_ed_prefixed(Emulator *emu, IndexMode mode)
         return 12;
     }
     case 0x71:
-        handle_out(emu->cpu.c, 0x00U);
+        handle_out(emu, emu->cpu.c, 0x00U);
         return 12;
     case 0x42:
     case 0x52:
@@ -3258,14 +3358,29 @@ static int execute_ed_prefixed(Emulator *emu, IndexMode mode)
     }
 }
 
-static void handle_out(uint8_t port, uint8_t value)
+static void handle_out(Emulator *emu, uint8_t port, uint8_t value)
 {
+    if (emu == NULL) {
+        return;
+    }
+
+    if (port == 0x03U) {
+        cpm_bdos_output_punch(emu, value);
+        return;
+    }
+
+    if (port == 0x05U) {
+        cpm_bdos_output_list(emu, value);
+        return;
+    }
+
     (void)port;
     (void)value;
 }
 
-static uint8_t handle_in(uint8_t port)
+static uint8_t handle_in(Emulator *emu, uint8_t port)
 {
+    (void)emu;
     (void)port;
     return 0x00U;
 }
@@ -3724,7 +3839,7 @@ static int execute_primary_opcode(Emulator *emu, uint8_t opcode, uint16_t pc)
     }
     case 0xD3: {
         uint8_t port = fetch8(emu);
-        handle_out(port, emu->cpu.a);
+        handle_out(emu, port, emu->cpu.a);
         return 11;
     }
     case 0xD6: {
@@ -3755,7 +3870,7 @@ static int execute_primary_opcode(Emulator *emu, uint8_t opcode, uint16_t pc)
     }
     case 0xDB: {
         uint8_t port = fetch8(emu);
-        emu->cpu.a = handle_in(port);
+        emu->cpu.a = handle_in(emu, port);
         return 11;
     }
     case 0xDD:
@@ -4280,6 +4395,8 @@ static bool parse_disk_geometry_spec(const char *spec, int *drive_index, DiskGeo
     geometry->sector_size = sector_size;
     geometry->track_count = track_count;
     geometry->translation_table_owned = false;
+    geometry->has_attribute_hints = false;
+    geometry->attribute_flags = 0U;
     *drive_index = index;
     return true;
 }
@@ -4396,6 +4513,8 @@ int main(int argc, char **argv)
         disk_geometries[i].allow_header = true;
         disk_geometries[i].directory_buffer_bytes = 0U;
         disk_geometries[i].has_directory_buffer = false;
+        disk_geometries[i].attribute_flags = 0U;
+        disk_geometries[i].has_attribute_hints = false;
         disk_translation_tables[i] = NULL;
         disk_translation_lengths[i] = 0U;
     }

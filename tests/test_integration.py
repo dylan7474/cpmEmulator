@@ -123,6 +123,22 @@ def assemble_source_lines(lines: list[str]) -> bytes:
             operand = tokens[1]
             instructions.append(('call', operand))
             program_counter += 3
+        elif directive == 'jmp':
+            operand = tokens[1]
+            instructions.append(('jmp', operand))
+            program_counter += 3
+        elif directive == 'jnz':
+            operand = tokens[1]
+            instructions.append(('jnz', operand))
+            program_counter += 3
+        elif directive == 'ora':
+            operand = tokens[1].lower()
+            instructions.append(('ora', operand))
+            program_counter += 1
+        elif directive == 'out':
+            operand = tokens[1]
+            instructions.append(('out', operand))
+            program_counter += 2
         elif directive == 'db':
             operand_text = text[text.lower().find('db') + 2:].strip()
             values = _parse_db_operands(operand_text)
@@ -207,6 +223,41 @@ def assemble_source_lines(lines: list[str]) -> bytes:
             output.append(0xCD)
             output.append(value & 0xFF)
             output.append((value >> 8) & 0xFF)
+        elif kind == 'jmp':
+            _, operand = entry
+            value = _resolve_operand(operand, labels, origin)
+            output.append(0xC3)
+            output.append(value & 0xFF)
+            output.append((value >> 8) & 0xFF)
+        elif kind == 'jnz':
+            _, operand = entry
+            value = _resolve_operand(operand, labels, origin)
+            output.append(0xC2)
+            output.append(value & 0xFF)
+            output.append((value >> 8) & 0xFF)
+        elif kind == 'ora':
+            _, operand = entry
+            register_codes = {
+                'b': 0,
+                'c': 1,
+                'd': 2,
+                'e': 3,
+                'h': 4,
+                'l': 5,
+                'm': 6,
+                'a': 7,
+            }
+            operand = operand.lower()
+            if operand not in register_codes:
+                raise ValueError(f"Unsupported register for ORA: {operand}")
+            output.append(0xB0 | register_codes[operand])
+        elif kind == 'out':
+            _, operand = entry
+            value = _resolve_operand(operand, labels, origin)
+            if not 0 <= value <= 0xFF:
+                raise ValueError(f"OUT operand out of range: {operand}")
+            output.append(0xD3)
+            output.append(value & 0xFF)
         elif kind == 'db':
             output.extend(entry[1])
 
@@ -501,6 +552,120 @@ class PunchListDeviceTest(unittest.TestCase):
         self.assertEqual(list_data, bytes(list_bytes))
 
 
+class ConsoleStatusTest(unittest.TestCase):
+    def test_console_status_reports_idle_and_ready(self) -> None:
+        _build_emulator()
+
+        assembly_lines = [
+            "org 0x0100",
+            "start:",
+            "    mvi c, 0x0B",
+            "    call 0x0005",
+            "    ora a",
+            "    jnz ready",
+            "    lxi d, idle_msg",
+            "    jmp print_status",
+            "ready:",
+            "    lxi d, ready_msg",
+            "print_status:",
+            "    mvi c, 0x09",
+            "    call 0x0005",
+            "    mvi c, 0x00",
+            "    call 0x0005",
+            "idle_msg:",
+            "    db 'IDLE', 0x0D, 0x0A, '$'",
+            "ready_msg:",
+            "    db 'READY', 0x0D, 0x0A, '$'",
+        ]
+
+        program_bytes = assemble_source_lines(assembly_lines)
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            binary_path = Path(tmpdir) / "console_status.bin"
+            binary_path.write_bytes(program_bytes)
+
+            idle_result = subprocess.run(
+                [str(REPO_ROOT / "z80"), str(binary_path)],
+                cwd=REPO_ROOT,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                check=False,
+            )
+
+            ready_result = subprocess.run(
+                [str(REPO_ROOT / "z80"), str(binary_path)],
+                cwd=REPO_ROOT,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                input="X",
+                check=False,
+            )
+
+        self.assertEqual(idle_result.returncode, 0, msg=idle_result.stdout)
+        self.assertIn("IDLE", idle_result.stdout)
+
+        self.assertEqual(ready_result.returncode, 0, msg=ready_result.stdout)
+        self.assertIn("READY", ready_result.stdout)
+
+
+class NoTrapDeviceCaptureTest(unittest.TestCase):
+    def test_bios_ports_capture_spool_without_traps(self) -> None:
+        _build_emulator()
+
+        punch_values = [0x50, 0x55, 0x4E, 0x43, 0x48]
+        list_values = [0x4C, 0x49, 0x53, 0x54]
+
+        assembly_lines = [
+            "org 0x0100",
+            "start:",
+        ]
+        for value in punch_values:
+            assembly_lines.extend([
+                f"    mvi a, 0x{value:02X}",
+                "    out 3",
+            ])
+        for value in list_values:
+            assembly_lines.extend([
+                f"    mvi a, 0x{value:02X}",
+                "    out 5",
+            ])
+        assembly_lines.append("    db 0x76")
+
+        program_bytes = assemble_source_lines(assembly_lines)
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            binary_path = Path(tmpdir) / "bios_ports.bin"
+            binary_path.write_bytes(program_bytes)
+            punch_path = Path(tmpdir) / "punch_ports.dat"
+            list_path = Path(tmpdir) / "list_ports.dat"
+
+            result = subprocess.run(
+                [
+                    str(REPO_ROOT / "z80"),
+                    "--no-cpm-traps",
+                    "--punch-out",
+                    str(punch_path),
+                    "--list-out",
+                    str(list_path),
+                    str(binary_path),
+                ],
+                cwd=REPO_ROOT,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                check=False,
+            )
+
+            punch_data = punch_path.read_bytes()
+            list_data = list_path.read_bytes()
+
+        self.assertEqual(result.returncode, 0, msg=f"No-trap spool capture failed:\n{result.stdout}")
+        self.assertEqual(punch_data, bytes(punch_values))
+        self.assertEqual(list_data, bytes(list_values))
+
+
 class FileAttributeTest(unittest.TestCase):
     def test_system_and_archive_bits_are_persisted(self) -> None:
         _build_emulator()
@@ -636,8 +801,9 @@ class DiskHeaderInferenceTest(unittest.TestCase):
         header.extend(b"CPMI")
         header.extend(struct.pack("<I", sector_size))
         header.extend(struct.pack("<I", sectors_per_track))
-        header.extend(struct.pack("<I", track_count | 0x20000000))
+        header.extend(struct.pack("<I", track_count | 0x20000000 | 0x10000000))
         header.extend(struct.pack("<H", dirbuf_size))
+        header.append(0x01)
 
         data = bytearray(sector_size * sectors_per_track * track_count)
         data[:sector_size] = bytes(range(sector_size))
@@ -686,9 +852,10 @@ class DiskHeaderDmaIntegrationTest(unittest.TestCase):
         header.extend(b"CPMI")
         header.extend(struct.pack("<I", sector_size))
         header.extend(struct.pack("<I", sectors_per_track))
-        header.extend(struct.pack("<I", track_count | 0x40000000 | 0x20000000))
+        header.extend(struct.pack("<I", track_count | 0x40000000 | 0x20000000 | 0x10000000))
         header.extend(struct.pack("<H", default_dma))
         header.extend(struct.pack("<H", dirbuf_size))
+        header.append(0x01)
 
         data = bytearray(sector_size * sectors_per_track * track_count)
 

@@ -10,6 +10,7 @@
 #define DISK_HEADER_FLAG_TRANSLATION 0x80000000U
 #define DISK_HEADER_FLAG_DEFAULT_DMA 0x40000000U
 #define DISK_HEADER_FLAG_DIRBUF 0x20000000U
+#define DISK_HEADER_FLAG_ATTRIBUTES 0x10000000U
 
 static DiskStatus disk_cache_ensure(DiskDrive *drive, size_t track, size_t sector);
 static void disk_parse_directory_entry_bytes(const uint8_t raw[32], DiskDirectoryEntry *entry);
@@ -55,7 +56,9 @@ static bool disk_try_apply_header(FILE *fp, DiskGeometry *geom, size_t file_size
     bool header_has_translation = (track_count_raw & DISK_HEADER_FLAG_TRANSLATION) != 0U;
     bool header_has_default_dma = (track_count_raw & DISK_HEADER_FLAG_DEFAULT_DMA) != 0U;
     bool header_has_dirbuf = (track_count_raw & DISK_HEADER_FLAG_DIRBUF) != 0U;
-    track_count_raw &= ~(DISK_HEADER_FLAG_TRANSLATION | DISK_HEADER_FLAG_DEFAULT_DMA | DISK_HEADER_FLAG_DIRBUF);
+    bool header_has_attributes = (track_count_raw & DISK_HEADER_FLAG_ATTRIBUTES) != 0U;
+    track_count_raw &= ~(DISK_HEADER_FLAG_TRANSLATION | DISK_HEADER_FLAG_DEFAULT_DMA | DISK_HEADER_FLAG_DIRBUF
+                          | DISK_HEADER_FLAG_ATTRIBUTES);
 
     if (sector_size == 0U || sectors_per_track == 0U) {
         (void)fseek(fp, original, SEEK_SET);
@@ -73,6 +76,11 @@ static bool disk_try_apply_header(FILE *fp, DiskGeometry *geom, size_t file_size
     bool original_has_default_dma = geom->has_default_dma;
     uint16_t original_default_dma = geom->default_dma_address;
     bool original_has_dirbuf = geom->has_directory_buffer;
+    bool original_has_attributes = geom->has_attribute_hints;
+    uint8_t original_attribute_flags = geom->attribute_flags;
+
+    geom->has_attribute_hints = false;
+    geom->attribute_flags = 0U;
     size_t original_dirbuf = geom->directory_buffer_bytes;
 
     if (header_has_default_dma) {
@@ -163,6 +171,21 @@ static bool disk_try_apply_header(FILE *fp, DiskGeometry *geom, size_t file_size
         offset += sizeof(dirbuf_bytes);
     }
 
+    if (header_has_attributes) {
+        if (file_size < offset + 1U) {
+            goto fail;
+        }
+
+        uint8_t attr_byte = 0U;
+        if (fread(&attr_byte, 1U, 1U, fp) != 1U) {
+            goto fail;
+        }
+
+        geom->attribute_flags = attr_byte;
+        geom->has_attribute_hints = true;
+        offset += 1U;
+    }
+
     *data_offset = offset;
 
     if (fseek(fp, (long)*data_offset, SEEK_SET) != 0) {
@@ -183,6 +206,8 @@ fail:
     geom->has_default_dma = original_has_default_dma;
     geom->directory_buffer_bytes = original_dirbuf;
     geom->has_directory_buffer = original_has_dirbuf;
+    geom->attribute_flags = original_attribute_flags;
+    geom->has_attribute_hints = original_has_attributes;
 
     (void)fseek(fp, original, SEEK_SET);
     return false;
@@ -831,18 +856,26 @@ int disk_mount(DiskDrive *drive, const char *path, const DiskGeometry *geometry)
         goto fail;
     }
 
+    bool header_read_only = geom.has_attribute_hints
+                             && (geom.attribute_flags & DISK_ATTRIBUTE_FLAG_READ_ONLY) != 0U;
+    bool combined_read_only = read_only || header_read_only;
+
     disk_unmount(drive);
 
     drive->fp = fp;
     drive->geometry = geom;
     drive->image_size = image_size;
     drive->mounted = true;
-    drive->read_only = read_only;
+    drive->host_read_only = read_only;
+    drive->header_read_only = header_read_only;
+    drive->read_only = combined_read_only;
     drive->default_dma_address = geom.has_default_dma ? geom.default_dma_address : 0U;
     drive->has_default_dma = geom.has_default_dma;
     drive->data_offset = data_offset;
     drive->directory_buffer_bytes = geom.has_directory_buffer ? geom.directory_buffer_bytes : 0U;
     drive->has_directory_buffer = geom.has_directory_buffer;
+    drive->attribute_flags = geom.attribute_flags;
+    drive->has_attribute_hints = geom.has_attribute_hints;
     drive->cache = cache;
     drive->cache_valid = false;
     drive->cache_track = 0U;
@@ -1028,11 +1061,15 @@ void disk_unmount(DiskDrive *drive)
     drive->image_size = 0U;
     drive->mounted = false;
     drive->read_only = false;
+    drive->host_read_only = false;
+    drive->header_read_only = false;
     drive->default_dma_address = 0U;
     drive->has_default_dma = false;
     drive->data_offset = 0U;
     drive->directory_buffer_bytes = 0U;
     drive->has_directory_buffer = false;
+    drive->attribute_flags = 0U;
+    drive->has_attribute_hints = false;
     disk_reset_metadata(drive);
     disk_invalidate_cache_internal(drive);
 }
