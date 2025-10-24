@@ -1,8 +1,6 @@
 from __future__ import annotations
 
-import subprocess
-import tempfile
-import unittest
+import struct
 import subprocess
 import tempfile
 import unittest
@@ -443,6 +441,51 @@ class DiskTranslationTableTest(unittest.TestCase):
         self.assertEqual(result.returncode, 0, msg=f"disk translation helper failed:\n{result.stdout}")
         self.assertIn("ALPHA.TXT", result.stdout)
         self.assertIn("GAMMA.BIN", result.stdout)
+
+
+class DiskHeaderInferenceTest(unittest.TestCase):
+    def test_header_infers_geometry(self) -> None:
+        sector_size = 256
+        sectors_per_track = 32
+        track_count = 4
+
+        header = bytearray()
+        header.extend(b"CPMI")
+        header.extend(struct.pack("<I", sector_size))
+        header.extend(struct.pack("<I", sectors_per_track))
+        header.extend(struct.pack("<I", track_count))
+
+        data = bytearray(sector_size * sectors_per_track * track_count)
+        data[:sector_size] = bytes(range(sector_size))
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            image_path = Path(tmpdir) / "header.img"
+            image_path.write_bytes(header + data)
+
+            binary_path = Path(tmpdir) / "header_probe"
+            compile_cmd = [
+                "gcc",
+                "-std=c11",
+                "-Wall",
+                "-Wextra",
+                "-I.",
+                str(REPO_ROOT / "tests" / "disk_header_test.c"),
+                str(REPO_ROOT / "disk.c"),
+                "-o",
+                str(binary_path),
+            ]
+            subprocess.run(compile_cmd, cwd=REPO_ROOT, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+
+            result = subprocess.run(
+                [str(binary_path), str(image_path)],
+                cwd=REPO_ROOT,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                check=False,
+            )
+
+        self.assertEqual(result.returncode, 0, msg=f"disk header helper failed:\n{result.stdout}")
 
 
 if __name__ == "__main__":

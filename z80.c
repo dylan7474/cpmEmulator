@@ -1113,6 +1113,18 @@ static void cpm_bdos_read_line(Emulator *emu, uint16_t address)
     memory_write8(emu, (uint16_t)(offset + count), '\r');
 }
 
+static void cpm_bdos_output_punch(uint8_t value)
+{
+    fputc((int)value, stdout);
+    fflush(stdout);
+}
+
+static void cpm_bdos_output_list(uint8_t value)
+{
+    fputc((int)value, stderr);
+    fflush(stderr);
+}
+
 static uint8_t cpm_bios_select_disk(Emulator *emu, uint8_t disk)
 {
     if (disk < CP_M_MAX_DISK_DRIVES && disk_is_mounted(&emu->disks[disk])) {
@@ -1279,6 +1291,14 @@ static int handle_bdos_call(Emulator *emu)
     case 0x02:
         putchar((int)emu->cpu.e);
         fflush(stdout);
+        return_code = emu->cpu.e;
+        break;
+    case 0x04:
+        cpm_bdos_output_punch(emu->cpu.e);
+        return_code = emu->cpu.e;
+        break;
+    case 0x05:
+        cpm_bdos_output_list(emu->cpu.e);
         return_code = emu->cpu.e;
         break;
     case 0x06:
@@ -3947,6 +3967,7 @@ static bool parse_disk_geometry_spec(const char *spec, int *drive_index, DiskGeo
 
     geometry->translation_table = NULL;
     geometry->translation_table_length = 0U;
+    geometry->allow_header = false;
 
     size_t len = strlen(spec);
     if (len == 0U || len >= 128U) {
@@ -4118,6 +4139,7 @@ int main(int argc, char **argv)
         disk_geometries[i].sector_size = DISK_DEFAULT_SECTOR_BYTES;
         disk_geometries[i].translation_table = NULL;
         disk_geometries[i].translation_table_length = 0U;
+        disk_geometries[i].allow_header = true;
         disk_translation_tables[i] = NULL;
         disk_translation_lengths[i] = 0U;
     }

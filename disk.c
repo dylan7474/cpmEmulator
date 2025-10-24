@@ -5,8 +5,80 @@
 #include <stdlib.h>
 #include <string.h>
 
+#define DISK_HEADER_MAGIC "CPMI"
+#define DISK_HEADER_SIZE 16U
+
 static DiskStatus disk_cache_ensure(DiskDrive *drive, size_t track, size_t sector);
 static void disk_parse_directory_entry_bytes(const uint8_t raw[32], DiskDirectoryEntry *entry);
+
+static bool disk_try_apply_header(FILE *fp, DiskGeometry *geom, size_t file_size, size_t *data_offset)
+{
+    if (fp == NULL || geom == NULL || data_offset == NULL) {
+        return false;
+    }
+
+    if (file_size < DISK_HEADER_SIZE) {
+        return false;
+    }
+
+    uint8_t header[DISK_HEADER_SIZE];
+    long original = ftell(fp);
+    if (original < 0L) {
+        original = 0L;
+    }
+
+    if (fseek(fp, 0L, SEEK_SET) != 0) {
+        return false;
+    }
+
+    size_t read = fread(header, 1U, sizeof(header), fp);
+    if (read != sizeof(header)) {
+        (void)fseek(fp, original, SEEK_SET);
+        return false;
+    }
+
+    if (memcmp(header, DISK_HEADER_MAGIC, strlen(DISK_HEADER_MAGIC)) != 0) {
+        (void)fseek(fp, original, SEEK_SET);
+        return false;
+    }
+
+    uint32_t sector_size = (uint32_t)header[4] | ((uint32_t)header[5] << 8) | ((uint32_t)header[6] << 16)
+                           | ((uint32_t)header[7] << 24);
+    uint32_t sectors_per_track = (uint32_t)header[8] | ((uint32_t)header[9] << 8) | ((uint32_t)header[10] << 16)
+                                 | ((uint32_t)header[11] << 24);
+    uint32_t track_count = (uint32_t)header[12] | ((uint32_t)header[13] << 8) | ((uint32_t)header[14] << 16)
+                           | ((uint32_t)header[15] << 24);
+
+    if (sector_size == 0U || sectors_per_track == 0U) {
+        (void)fseek(fp, original, SEEK_SET);
+        return false;
+    }
+
+    geom->sector_size = (size_t)sector_size;
+    geom->sectors_per_track = (size_t)sectors_per_track;
+    geom->track_count = (size_t)track_count;
+    *data_offset = DISK_HEADER_SIZE;
+
+    if (fseek(fp, (long)*data_offset, SEEK_SET) != 0) {
+        (void)fseek(fp, original, SEEK_SET);
+        return false;
+    }
+
+    return true;
+}
+
+static void disk_apply_host_read_only_flag(const DiskDrive *drive, uint8_t *entry_raw)
+{
+    if (drive == NULL || entry_raw == NULL || !drive->read_only) {
+        return;
+    }
+
+    if (entry_raw[0] == 0xE5U || entry_raw[0] == 0x00U) {
+        return;
+    }
+
+    entry_raw[9] |= 0x80U;
+}
 
 static long compute_offset(const DiskDrive *drive, size_t track, size_t sector)
 {
@@ -38,6 +110,12 @@ static long compute_offset(const DiskDrive *drive, size_t track, size_t sector)
     }
 
     size_t byte_offset = index * sector_bytes;
+    if (drive->data_offset > SIZE_MAX - byte_offset) {
+        return -1L;
+    }
+
+    byte_offset += drive->data_offset;
+
     if (byte_offset > (size_t)LONG_MAX) {
         return -1L;
     }
@@ -345,6 +423,13 @@ static bool disk_refresh_directory_metadata(DiskDrive *drive)
         }
     }
 
+    if (drive->read_only) {
+        size_t entry_count = drive->directory_metadata_bytes / 32U;
+        for (size_t i = 0U; i < entry_count; ++i) {
+            disk_apply_host_read_only_flag(drive, drive->directory_metadata + i * 32U);
+        }
+    }
+
     if (!drive->allocation_vector_from_bios) {
         disk_recompute_allocation_vector(drive);
     }
@@ -570,6 +655,32 @@ int disk_mount(DiskDrive *drive, const char *path, const DiskGeometry *geometry)
     }
 
     size_t image_size = (size_t)file_size;
+    size_t data_offset = 0U;
+
+    if (fseek(fp, 0L, SEEK_SET) != 0) {
+        fclose(fp);
+        return -1;
+    }
+
+    if (geom.allow_header) {
+        size_t header_offset = 0U;
+        if (disk_try_apply_header(fp, &geom, image_size, &header_offset)) {
+            data_offset = header_offset;
+        } else {
+            if (fseek(fp, 0L, SEEK_SET) != 0) {
+                fclose(fp);
+                return -1;
+            }
+        }
+    }
+
+    if (data_offset > image_size) {
+        fclose(fp);
+        return -1;
+    }
+
+    image_size -= data_offset;
+
     size_t track_bytes = geom.sectors_per_track * geom.sector_size;
 
     if (track_bytes > 0U) {
@@ -588,7 +699,7 @@ int disk_mount(DiskDrive *drive, const char *path, const DiskGeometry *geometry)
         }
     }
 
-    if (fseek(fp, 0L, SEEK_SET) != 0) {
+    if (fseek(fp, (long)data_offset, SEEK_SET) != 0) {
         fclose(fp);
         return -1;
     }
@@ -606,6 +717,7 @@ int disk_mount(DiskDrive *drive, const char *path, const DiskGeometry *geometry)
     drive->image_size = image_size;
     drive->mounted = true;
     drive->read_only = read_only;
+    drive->data_offset = data_offset;
     drive->cache = cache;
     drive->cache_valid = false;
     drive->cache_track = 0U;
@@ -765,6 +877,7 @@ void disk_unmount(DiskDrive *drive)
     drive->image_size = 0U;
     drive->mounted = false;
     drive->read_only = false;
+    drive->data_offset = 0U;
     disk_reset_metadata(drive);
     disk_invalidate_cache_internal(drive);
 }
@@ -872,6 +985,7 @@ DiskStatus disk_read_directory_entry(DiskDrive *drive, size_t index, DiskDirecto
         }
     }
 
+    disk_apply_host_read_only_flag(drive, raw);
     disk_parse_directory_entry_bytes(raw, entry);
     return DISK_STATUS_OK;
 }
