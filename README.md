@@ -64,6 +64,15 @@ To experiment with a full CP/M environment instead of a transient program, boot 
 
 The script decodes the CCP/BDOS and BIOS binaries stored under `third_party/cpm22/`, loads them at the same addresses used by the tests, disables the host BDOS and BIOS traps, and runs the machine long enough to reach the CP/M prompt. When the supervisor finishes booting you can issue standard commands such as `DIR` or `TYPE` against any mounted disk images.
 
+If you need the raw CP/M system images outside of the helper script, decode the bundled Base64 assets yourself:
+
+```bash
+base64 -d third_party/cpm22/cpm.bin.base64 > /tmp/cpm.bin
+base64 -d third_party/cpm22/bios.bin.base64 > /tmp/bios.bin
+```
+
+Both commands emit the same `cpm.bin` (CCP/BDOS) and `bios.bin` blobs that the regression suite boots.
+
 To wire up the console session manually, mimic the options used by the helper script. First decode the base64 resources into raw binaries (for example, `/tmp/cpm.bin` and `/tmp/bios.bin`), then launch the emulator with:
 
 ```bash
