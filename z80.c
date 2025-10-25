@@ -28,6 +28,8 @@
 
 #define MEMORY_SIZE 0x10000U
 #define CP_M_LOAD_ADDRESS 0x0100U
+#define CP_M_SUPERVISOR_BASE 0xDC00U
+#define CP_M_BIOS_BASE 0xFA00U
 #define DEFAULT_MAX_CYCLES 1000000ULL
 #define CP_M_BIOS_ENTRY 0x0000U
 #define CP_M_BDOS_ENTRY 0x0005U
@@ -111,6 +113,10 @@ typedef struct {
     bool punch_close;
     FILE *list_fp;
     bool list_close;
+    uint16_t supervisor_base;
+    size_t supervisor_size;
+    uint16_t bios_base;
+    size_t bios_size;
 } Emulator;
 
 static inline uint16_t z80_bc(const Z80 *cpu)
@@ -4049,6 +4055,10 @@ static void emulator_init(Emulator *emu)
     emu->punch_close = false;
     emu->list_fp = NULL;
     emu->list_close = false;
+    emu->supervisor_base = 0U;
+    emu->supervisor_size = 0U;
+    emu->bios_base = 0U;
+    emu->bios_size = 0U;
 }
 
 static void emulator_unmount_disks(Emulator *emu)
@@ -4290,7 +4300,130 @@ static size_t load_binary_file(Emulator *emu, const char *path, uint16_t address
     }
 
     fclose(fp);
+    if (total != 0U) {
+        if (address == CP_M_SUPERVISOR_BASE) {
+            emu->supervisor_base = address;
+            emu->supervisor_size = total;
+        } else if (address == CP_M_BIOS_BASE) {
+            emu->bios_base = address;
+            emu->bios_size = total;
+        }
+    }
     return total;
+}
+
+static bool create_ephemeral_system_disk(const Emulator *emu, DiskGeometry *geometry, char **path_out)
+{
+    if (emu == NULL || geometry == NULL || path_out == NULL) {
+        errno = EINVAL;
+        return false;
+    }
+
+    if (emu->supervisor_size == 0U || emu->bios_size == 0U) {
+        errno = EINVAL;
+        return false;
+    }
+
+    size_t sectors_per_track = geometry->sectors_per_track;
+    if (sectors_per_track == 0U) {
+        sectors_per_track = DISK_DEFAULT_SECTORS_PER_TRACK;
+    }
+
+    size_t sector_size = geometry->sector_size;
+    if (sector_size == 0U) {
+        sector_size = DISK_DEFAULT_SECTOR_BYTES;
+    }
+
+    size_t track_count = geometry->track_count;
+    if (track_count == 0U) {
+        track_count = 80U;
+    }
+
+    if (sectors_per_track == 0U || sector_size == 0U || track_count == 0U) {
+        errno = EINVAL;
+        return false;
+    }
+
+    size_t total_bytes = sectors_per_track * sector_size * track_count;
+    if (total_bytes == 0U) {
+        errno = EINVAL;
+        return false;
+    }
+
+    uint8_t *buffer = (uint8_t *)malloc(total_bytes);
+    if (buffer == NULL) {
+        return false;
+    }
+    memset(buffer, 0xE5, total_bytes);
+
+    size_t reserved_tracks = 3U;
+    if (reserved_tracks > track_count) {
+        reserved_tracks = track_count;
+    }
+    size_t system_bytes = reserved_tracks * sectors_per_track * sector_size;
+
+    size_t copy = emu->supervisor_size;
+    if (copy > system_bytes) {
+        copy = system_bytes;
+    }
+    memcpy(buffer, &emu->memory[emu->supervisor_base], copy);
+
+    size_t offset = copy;
+    if (offset < system_bytes && emu->bios_size != 0U) {
+        size_t remaining = system_bytes - offset;
+        size_t bios_copy = emu->bios_size;
+        if (bios_copy > remaining) {
+            bios_copy = remaining;
+        }
+        memcpy(buffer + offset, &emu->memory[emu->bios_base], bios_copy);
+    }
+
+    char template_path[] = "/tmp/cpm-XXXXXX";
+    int fd = mkstemp(template_path);
+    if (fd < 0) {
+        free(buffer);
+        return false;
+    }
+
+    size_t written = 0U;
+    while (written < total_bytes) {
+        ssize_t chunk = write(fd, buffer + written, total_bytes - written);
+        if (chunk <= 0) {
+            int saved_errno = (chunk < 0) ? errno : EIO;
+            close(fd);
+            unlink(template_path);
+            free(buffer);
+            errno = saved_errno;
+            return false;
+        }
+        written += (size_t)chunk;
+    }
+
+    if (close(fd) != 0) {
+        int saved_errno = errno;
+        unlink(template_path);
+        free(buffer);
+        errno = saved_errno;
+        return false;
+    }
+
+    free(buffer);
+
+    char *path = strdup(template_path);
+    if (path == NULL) {
+        int saved_errno = errno;
+        unlink(template_path);
+        errno = saved_errno != 0 ? saved_errno : ENOMEM;
+        return false;
+    }
+
+    geometry->sectors_per_track = sectors_per_track;
+    geometry->sector_size = sector_size;
+    geometry->track_count = track_count;
+    geometry->allow_header = false;
+
+    *path_out = path;
+    return true;
 }
 
 static void usage(const char *prog)
@@ -4571,6 +4704,8 @@ int main(int argc, char **argv)
     DiskGeometry disk_geometries[CP_M_MAX_DISK_DRIVES];
     uint8_t *disk_translation_tables[CP_M_MAX_DISK_DRIVES];
     size_t disk_translation_lengths[CP_M_MAX_DISK_DRIVES];
+    char *ephemeral_disk_path = NULL;
+    bool ephemeral_disk_created = false;
     for (size_t i = 0; i < CP_M_MAX_DISK_DRIVES; ++i) {
         disk_paths[i] = NULL;
         disk_geometries[i].track_count = 0U;
@@ -4791,6 +4926,27 @@ int main(int argc, char **argv)
         disk_geometries[i].translation_table_length = disk_translation_lengths[i];
     }
 
+    bool disk_specified = false;
+    for (size_t i = 0; i < CP_M_MAX_DISK_DRIVES; ++i) {
+        if (disk_paths[i] != NULL) {
+            disk_specified = true;
+            break;
+        }
+    }
+
+    if (!disk_specified && !emu.trap_cpm_calls) {
+        DiskGeometry geom = disk_geometries[0];
+        char *path = NULL;
+        if (create_ephemeral_system_disk(&emu, &geom, &path)) {
+            disk_geometries[0] = geom;
+            disk_paths[0] = path;
+            ephemeral_disk_path = path;
+            ephemeral_disk_created = true;
+        } else {
+            fprintf(stderr, "Failed to create ephemeral system disk: %s\n", strerror(errno));
+        }
+    }
+
     for (size_t i = 0; i < CP_M_MAX_DISK_DRIVES; ++i) {
         if (disk_paths[i] != NULL) {
             if (disk_mount(&emu.disks[i], disk_paths[i], &disk_geometries[i]) != 0) {
@@ -4802,6 +4958,13 @@ int main(int argc, char **argv)
                 return EXIT_FAILURE;
             }
         }
+    }
+
+    if (ephemeral_disk_created && ephemeral_disk_path != NULL) {
+        unlink(ephemeral_disk_path);
+        free(ephemeral_disk_path);
+        disk_paths[0] = NULL;
+        ephemeral_disk_path = NULL;
     }
 
     for (size_t i = 0; i < CP_M_MAX_DISK_DRIVES; ++i) {
