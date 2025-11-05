@@ -27,6 +27,10 @@
 #include "disk.h"
 
 #define MEMORY_SIZE 0x10000U
+#define ZX128_ROM_BANK_SIZE 0x4000U
+#define ZX128_ROM_BANK_COUNT 2U
+#define ZX128_RAM_BANK_SIZE 0x4000U
+#define ZX128_RAM_BANK_COUNT 8U
 #define CP_M_LOAD_ADDRESS 0x0100U
 #define CP_M_SUPERVISOR_BASE 0xDC00U
 #define CP_M_BIOS_BASE 0xFA00U
@@ -117,6 +121,18 @@ typedef struct {
     size_t supervisor_size;
     uint16_t bios_base;
     size_t bios_size;
+    enum {
+        EMULATOR_MODEL_CPM = 0,
+        EMULATOR_MODEL_ZX128K = 1
+    } model;
+    bool zx128_rom_loaded;
+    uint8_t zx128_rom[ZX128_ROM_BANK_COUNT][ZX128_ROM_BANK_SIZE];
+    uint8_t zx128_ram[ZX128_RAM_BANK_COUNT][ZX128_RAM_BANK_SIZE];
+    uint8_t zx128_active_rom;
+    uint8_t zx128_active_ram_bank;
+    bool zx128_paging_locked;
+    uint8_t zx128_screen_bank;
+    uint8_t zx128_last_page_value;
 } Emulator;
 
 static inline uint16_t z80_bc(const Z80 *cpu)
@@ -241,13 +257,169 @@ static inline uint16_t memory_read16(const Emulator *emu, uint16_t address)
 
 static inline void memory_write8(Emulator *emu, uint16_t address, uint8_t value)
 {
+    if (emu->model == EMULATOR_MODEL_ZX128K) {
+        if (address < ZX128_ROM_BANK_SIZE) {
+            return;
+        }
+
+        if (address >= 0x4000U && address < 0x8000U) {
+            size_t offset = (size_t)(address - 0x4000U);
+            if (offset < ZX128_RAM_BANK_SIZE) {
+                emu->zx128_ram[5][offset] = value;
+            }
+        } else if (address >= 0x8000U && address < 0xC000U) {
+            size_t offset = (size_t)(address - 0x8000U);
+            if (offset < ZX128_RAM_BANK_SIZE) {
+                emu->zx128_ram[2][offset] = value;
+            }
+        } else if (address >= 0xC000U) {
+            size_t offset = (size_t)(address - 0xC000U);
+            if (offset < ZX128_RAM_BANK_SIZE && emu->zx128_active_ram_bank < ZX128_RAM_BANK_COUNT) {
+                emu->zx128_ram[emu->zx128_active_ram_bank][offset] = value;
+            }
+        }
+    }
+
     emu->memory[address] = value;
 }
 
 static inline void memory_write16(Emulator *emu, uint16_t address, uint16_t value)
 {
-    emu->memory[address] = (uint8_t)(value & 0xFFU);
-    emu->memory[(uint16_t)(address + 1U)] = (uint8_t)((value >> 8) & 0xFFU);
+    memory_write8(emu, address, (uint8_t)(value & 0xFFU));
+    memory_write8(emu, (uint16_t)(address + 1U), (uint8_t)((value >> 8) & 0xFFU));
+}
+
+static void zx128_refresh_rom(Emulator *emu)
+{
+    if (emu == NULL || emu->model != EMULATOR_MODEL_ZX128K) {
+        return;
+    }
+
+    if (!emu->zx128_rom_loaded) {
+        memset(&emu->memory[0x0000], 0xFF, ZX128_ROM_BANK_SIZE);
+        return;
+    }
+
+    if (emu->zx128_active_rom >= ZX128_ROM_BANK_COUNT) {
+        emu->zx128_active_rom = 0U;
+    }
+
+    memcpy(&emu->memory[0x0000], emu->zx128_rom[emu->zx128_active_rom], ZX128_ROM_BANK_SIZE);
+}
+
+static void zx128_refresh_fixed_ram(Emulator *emu)
+{
+    if (emu == NULL || emu->model != EMULATOR_MODEL_ZX128K) {
+        return;
+    }
+
+    memcpy(&emu->memory[0x4000], emu->zx128_ram[5], ZX128_RAM_BANK_SIZE);
+    memcpy(&emu->memory[0x8000], emu->zx128_ram[2], ZX128_RAM_BANK_SIZE);
+}
+
+static void zx128_refresh_paged_ram(Emulator *emu)
+{
+    if (emu == NULL || emu->model != EMULATOR_MODEL_ZX128K) {
+        return;
+    }
+
+    if (emu->zx128_active_ram_bank >= ZX128_RAM_BANK_COUNT) {
+        emu->zx128_active_ram_bank = 0U;
+    }
+
+    memcpy(&emu->memory[0xC000], emu->zx128_ram[emu->zx128_active_ram_bank], ZX128_RAM_BANK_SIZE);
+}
+
+static void zx128_refresh_memory_map(Emulator *emu)
+{
+    if (emu == NULL || emu->model != EMULATOR_MODEL_ZX128K) {
+        return;
+    }
+
+    zx128_refresh_rom(emu);
+    zx128_refresh_fixed_ram(emu);
+    zx128_refresh_paged_ram(emu);
+}
+
+static void zx128_initialise_model(Emulator *emu)
+{
+    if (emu == NULL) {
+        return;
+    }
+
+    emu->model = EMULATOR_MODEL_ZX128K;
+    emu->trap_cpm_calls = false;
+    emu->zx128_rom_loaded = false;
+    emu->zx128_active_rom = 0U;
+    emu->zx128_active_ram_bank = 0U;
+    emu->zx128_paging_locked = false;
+    emu->zx128_screen_bank = 0U;
+    emu->zx128_last_page_value = 0U;
+    for (size_t i = 0; i < ZX128_RAM_BANK_COUNT; ++i) {
+        memset(emu->zx128_ram[i], 0, ZX128_RAM_BANK_SIZE);
+    }
+    zx128_refresh_memory_map(emu);
+}
+
+static void zx128_handle_paging(Emulator *emu, uint8_t value)
+{
+    if (emu == NULL || emu->model != EMULATOR_MODEL_ZX128K) {
+        return;
+    }
+
+    emu->zx128_last_page_value = value;
+    if (emu->zx128_paging_locked) {
+        return;
+    }
+
+    emu->zx128_active_ram_bank = value & 0x07U;
+    emu->zx128_screen_bank = (value & 0x08U) ? 1U : 0U;
+    emu->zx128_active_rom = (value & 0x10U) ? 1U : 0U;
+    if ((value & 0x20U) != 0U) {
+        emu->zx128_paging_locked = true;
+    }
+
+    zx128_refresh_rom(emu);
+    zx128_refresh_paged_ram(emu);
+}
+
+static bool zx128_load_rom_image(Emulator *emu, const char *path)
+{
+    if (emu == NULL || path == NULL) {
+        return false;
+    }
+
+    FILE *fp = fopen(path, "rb");
+    if (fp == NULL) {
+        fprintf(stderr, "Failed to open ROM '%s': %s\n", path, strerror(errno));
+        return false;
+    }
+
+    uint8_t buffer[ZX128_ROM_BANK_SIZE * ZX128_ROM_BANK_COUNT];
+    size_t total = fread(buffer, 1U, sizeof(buffer), fp);
+    if (ferror(fp) != 0) {
+        fprintf(stderr, "Error reading ROM '%s'\n", path);
+        fclose(fp);
+        return false;
+    }
+    fclose(fp);
+
+    if (total != ZX128_ROM_BANK_SIZE && total != sizeof(buffer)) {
+        fprintf(stderr, "Unsupported ROM size %zu for '%s' (expected 16K or 32K)\n", total, path);
+        return false;
+    }
+
+    memcpy(emu->zx128_rom[0], buffer, ZX128_ROM_BANK_SIZE);
+    if (total == sizeof(buffer)) {
+        memcpy(emu->zx128_rom[1], buffer + ZX128_ROM_BANK_SIZE, ZX128_ROM_BANK_SIZE);
+    } else {
+        memcpy(emu->zx128_rom[1], buffer, ZX128_ROM_BANK_SIZE);
+    }
+
+    emu->zx128_rom_loaded = true;
+    emu->zx128_active_rom = 0U;
+    zx128_refresh_rom(emu);
+    return true;
 }
 
 static uint16_t bios_allocate(Emulator *emu, size_t size, size_t alignment)
@@ -1754,8 +1926,8 @@ static bool handle_cpm_entry(Emulator *emu, int *cycles)
     return false;
 }
 
-static void handle_out(Emulator *emu, uint8_t port, uint8_t value);
-static uint8_t handle_in(Emulator *emu, uint8_t port);
+static void handle_out(Emulator *emu, uint16_t port, uint8_t value);
+static uint8_t handle_in(Emulator *emu, uint16_t port);
 static uint8_t fetch8(Emulator *emu);
 static uint16_t fetch16(Emulator *emu);
 static int execute_ld_r_n(Emulator *emu, uint8_t opcode);
@@ -3053,8 +3225,9 @@ static int execute_ed_prefixed(Emulator *emu, IndexMode mode)
     case 0x68:
     case 0x78: {
         uint8_t *reg = decode_register(&emu->cpu, (opcode >> 3) & 0x07U);
+        uint16_t port = (uint16_t)(((uint16_t)emu->cpu.b << 8) | emu->cpu.c);
         if (reg != NULL) {
-            uint8_t value = handle_in(emu, emu->cpu.c);
+            uint8_t value = handle_in(emu, port);
             *reg = value;
             set_flag(&emu->cpu, FLAG_S, (value & 0x80U) != 0U);
             set_flag(&emu->cpu, FLAG_Z, value == 0U);
@@ -3073,7 +3246,8 @@ static int execute_ed_prefixed(Emulator *emu, IndexMode mode)
     case 0x79: {
         uint8_t *reg = decode_register(&emu->cpu, (opcode >> 3) & 0x07U);
         uint8_t value = (reg != NULL) ? *reg : 0U;
-        handle_out(emu, emu->cpu.c, value);
+        uint16_t port = (uint16_t)(((uint16_t)emu->cpu.b << 8) | emu->cpu.c);
+        handle_out(emu, port, value);
         return 12;
     }
     case 0x44:
@@ -3169,7 +3343,8 @@ static int execute_ed_prefixed(Emulator *emu, IndexMode mode)
         return 18;
     }
     case 0x70: {
-        uint8_t value = handle_in(emu, emu->cpu.c);
+        uint16_t port = (uint16_t)(((uint16_t)emu->cpu.b << 8) | emu->cpu.c);
+        uint8_t value = handle_in(emu, port);
         set_flag(&emu->cpu, FLAG_S, (value & 0x80U) != 0U);
         set_flag(&emu->cpu, FLAG_Z, value == 0U);
         set_flag(&emu->cpu, FLAG_H, false);
@@ -3178,7 +3353,8 @@ static int execute_ed_prefixed(Emulator *emu, IndexMode mode)
         return 12;
     }
     case 0x71:
-        handle_out(emu, emu->cpu.c, 0x00U);
+        uint16_t port = (uint16_t)(((uint16_t)emu->cpu.b << 8) | emu->cpu.c);
+        handle_out(emu, port, 0x00U);
         return 12;
     case 0x42:
     case 0x52:
@@ -3372,13 +3548,21 @@ static int execute_ed_prefixed(Emulator *emu, IndexMode mode)
     }
 }
 
-static void handle_out(Emulator *emu, uint8_t port, uint8_t value)
+static void handle_out(Emulator *emu, uint16_t port, uint8_t value)
 {
     if (emu == NULL) {
         return;
     }
 
-    switch (port) {
+    if (emu->model == EMULATOR_MODEL_ZX128K) {
+        if (port == 0x7FFDU) {
+            zx128_handle_paging(emu, value);
+        }
+        return;
+    }
+
+    uint8_t low = (uint8_t)(port & 0x00FFU);
+    switch (low) {
     case 0x01U:
         cpm_bios_console_output(emu, value);
         return;
@@ -3424,13 +3608,21 @@ static void handle_out(Emulator *emu, uint8_t port, uint8_t value)
     (void)value;
 }
 
-static uint8_t handle_in(Emulator *emu, uint8_t port)
+static uint8_t handle_in(Emulator *emu, uint16_t port)
 {
     if (emu == NULL) {
         return 0x00U;
     }
 
-    switch (port) {
+    if (emu->model == EMULATOR_MODEL_ZX128K) {
+        if (port == 0x7FFDU) {
+            return emu->zx128_last_page_value;
+        }
+        return 0xFFU;
+    }
+
+    uint8_t low = (uint8_t)(port & 0x00FFU);
+    switch (low) {
     case 0x00U:
         return cpm_bdos_console_status(emu);
     case 0x01U:
@@ -3914,7 +4106,8 @@ static int execute_primary_opcode(Emulator *emu, uint8_t opcode, uint16_t pc)
         return 7;
     }
     case 0xD3: {
-        uint8_t port = fetch8(emu);
+        uint8_t port_low = fetch8(emu);
+        uint16_t port = (uint16_t)(((uint16_t)emu->cpu.a << 8) | port_low);
         handle_out(emu, port, emu->cpu.a);
         return 11;
     }
@@ -3945,7 +4138,8 @@ static int execute_primary_opcode(Emulator *emu, uint8_t opcode, uint16_t pc)
         return 4;
     }
     case 0xDB: {
-        uint8_t port = fetch8(emu);
+        uint8_t port_low = fetch8(emu);
+        uint16_t port = (uint16_t)(((uint16_t)emu->cpu.a << 8) | port_low);
         emu->cpu.a = handle_in(emu, port);
         return 11;
     }
@@ -4040,6 +4234,7 @@ static void emulator_init(Emulator *emu)
 {
     memset(emu, 0, sizeof(*emu));
     z80_reset(&emu->cpu);
+    emu->model = EMULATOR_MODEL_CPM;
     emu->dma_address = CP_M_DEFAULT_DMA;
     emu->bios_selected_disk = 0xFFU;
     emu->bios_track = 0U;
@@ -4221,7 +4416,7 @@ static size_t load_intel_hex_file(Emulator *emu, const char *path)
                     fclose(fp);
                     return 0U;
                 }
-                emu->memory[addr] = data_bytes[i];
+                memory_write8(emu, (uint16_t)addr, data_bytes[i]);
                 ++total;
             }
         } else if (record_type == 0x01U) {
@@ -4282,19 +4477,33 @@ static size_t load_binary_file(Emulator *emu, const char *path, uint16_t address
         return 0U;
     }
 
-    size_t offset = address;
+    uint32_t offset = address;
     size_t total = 0U;
-    while (offset < MEMORY_SIZE) {
-        size_t chunk = fread(&emu->memory[offset], 1U, MEMORY_SIZE - offset, fp);
+    uint8_t buffer[4096];
+
+    while (true) {
+        size_t chunk = fread(buffer, 1U, sizeof(buffer), fp);
         if (chunk == 0U) {
             break;
         }
+
+        for (size_t i = 0U; i < chunk; ++i) {
+            uint32_t addr = offset + (uint32_t)i;
+            if (addr >= MEMORY_SIZE) {
+                fprintf(stderr, "Binary '%s' truncated while loading at 0x%04X\n", path, address);
+                fclose(fp);
+                return 0U;
+            }
+
+            memory_write8(emu, (uint16_t)addr, buffer[i]);
+            ++total;
+        }
+
         offset += chunk;
-        total += chunk;
     }
 
-    if (offset >= MEMORY_SIZE && fgetc(fp) != EOF) {
-        fprintf(stderr, "Binary '%s' truncated while loading at 0x%04X\n", path, address);
+    if (ferror(fp) != 0) {
+        fprintf(stderr, "Error reading %s\n", path);
         fclose(fp);
         return 0U;
     }
@@ -4429,11 +4638,12 @@ static bool create_ephemeral_system_disk(const Emulator *emu, DiskGeometry *geom
 static void usage(const char *prog)
 {
     fprintf(stderr,
-            "Usage: %s [--cycles N] [--disk DRIVE:path] [--disk-geom DRIVE:spt:ssize[:tracks]]\n"
+            "Usage: %s [--model cpm|128k] [--cycles N] [--disk DRIVE:path] [--disk-geom DRIVE:spt:ssize[:tracks]]\n"
             "           [--disk-xlt DRIVE:map] [--disk-a path] [--reader path]\n"
             "           [--punch-out path] [--list-out path]\n"
             "           [--load addr:file] [--load-hex path] [--entry addr]\n"
-            "           [--no-cpm-traps] [program.bin]\n",
+            "           [--no-cpm-traps] [program.bin]\n"
+            "When --model 128k is selected, provide a 16K or 32K ROM image path instead of a program.\n",
             prog);
 }
 
@@ -4695,6 +4905,7 @@ int main(int argc, char **argv)
     emulator_init(&emu);
 
     const char *program_path = NULL;
+    const char *rom_path = NULL;
     uint64_t max_cycles = DEFAULT_MAX_CYCLES;
     uint16_t entry_point = CP_M_LOAD_ADDRESS;
     bool entry_specified = false;
@@ -4732,6 +4943,25 @@ int main(int argc, char **argv)
                 return EXIT_FAILURE;
             }
             max_cycles = parse_cycles(argv[++i]);
+        } else if (strcmp(argv[i], "--model") == 0) {
+            if (i + 1 >= argc) {
+                usage(argv[0]);
+                return EXIT_FAILURE;
+            }
+            const char *model = argv[++i];
+            if (strcmp(model, "128k") == 0) {
+                zx128_initialise_model(&emu);
+                entry_point = 0x0000U;
+                program_path = NULL;
+                rom_path = NULL;
+                memory_loaded = false;
+            } else if (strcmp(model, "cpm") == 0) {
+                emu.model = EMULATOR_MODEL_CPM;
+                emu.trap_cpm_calls = true;
+            } else {
+                fprintf(stderr, "Unknown model '%s'\n", model);
+                return EXIT_FAILURE;
+            }
         } else if (strcmp(argv[i], "--disk") == 0) {
             if (i + 1 >= argc) {
                 usage(argv[0]);
@@ -4917,7 +5147,15 @@ int main(int argc, char **argv)
             usage(argv[0]);
             return EXIT_FAILURE;
         } else {
-            program_path = argv[i];
+            if (emu.model == EMULATOR_MODEL_ZX128K) {
+                if (rom_path != NULL) {
+                    fprintf(stderr, "Multiple ROM images specified\n");
+                    return EXIT_FAILURE;
+                }
+                rom_path = argv[i];
+            } else {
+                program_path = argv[i];
+            }
         }
     }
 
@@ -4926,45 +5164,56 @@ int main(int argc, char **argv)
         disk_geometries[i].translation_table_length = disk_translation_lengths[i];
     }
 
-    bool disk_specified = false;
-    for (size_t i = 0; i < CP_M_MAX_DISK_DRIVES; ++i) {
-        if (disk_paths[i] != NULL) {
-            disk_specified = true;
-            break;
-        }
-    }
-
-    if (!disk_specified && !emu.trap_cpm_calls) {
-        DiskGeometry geom = disk_geometries[0];
-        char *path = NULL;
-        if (create_ephemeral_system_disk(&emu, &geom, &path)) {
-            disk_geometries[0] = geom;
-            disk_paths[0] = path;
-            ephemeral_disk_path = path;
-            ephemeral_disk_created = true;
-        } else {
-            fprintf(stderr, "Failed to create ephemeral system disk: %s\n", strerror(errno));
-        }
-    }
-
-    for (size_t i = 0; i < CP_M_MAX_DISK_DRIVES; ++i) {
-        if (disk_paths[i] != NULL) {
-            if (disk_mount(&emu.disks[i], disk_paths[i], &disk_geometries[i]) != 0) {
-                fprintf(stderr, "Failed to mount disk image '%s' for drive %c\n", disk_paths[i], (int)('A' + i));
-                emulator_unmount_disks(&emu);
-                for (size_t j = 0; j < CP_M_MAX_DISK_DRIVES; ++j) {
-                    free(disk_translation_tables[j]);
-                }
-                return EXIT_FAILURE;
+    if (emu.model == EMULATOR_MODEL_CPM) {
+        bool disk_specified = false;
+        for (size_t i = 0; i < CP_M_MAX_DISK_DRIVES; ++i) {
+            if (disk_paths[i] != NULL) {
+                disk_specified = true;
+                break;
             }
         }
-    }
 
-    if (ephemeral_disk_created && ephemeral_disk_path != NULL) {
-        unlink(ephemeral_disk_path);
-        free(ephemeral_disk_path);
-        disk_paths[0] = NULL;
-        ephemeral_disk_path = NULL;
+        if (!disk_specified && !emu.trap_cpm_calls) {
+            DiskGeometry geom = disk_geometries[0];
+            char *path = NULL;
+            if (create_ephemeral_system_disk(&emu, &geom, &path)) {
+                disk_geometries[0] = geom;
+                disk_paths[0] = path;
+                ephemeral_disk_path = path;
+                ephemeral_disk_created = true;
+            } else {
+                fprintf(stderr, "Failed to create ephemeral system disk: %s\n", strerror(errno));
+            }
+        }
+
+        for (size_t i = 0; i < CP_M_MAX_DISK_DRIVES; ++i) {
+            if (disk_paths[i] != NULL) {
+                if (disk_mount(&emu.disks[i], disk_paths[i], &disk_geometries[i]) != 0) {
+                    fprintf(stderr, "Failed to mount disk image '%s' for drive %c\n", disk_paths[i], (int)('A' + i));
+                    emulator_unmount_disks(&emu);
+                    for (size_t j = 0; j < CP_M_MAX_DISK_DRIVES; ++j) {
+                        free(disk_translation_tables[j]);
+                    }
+                    return EXIT_FAILURE;
+                }
+            }
+        }
+
+        if (ephemeral_disk_created && ephemeral_disk_path != NULL) {
+            unlink(ephemeral_disk_path);
+            free(ephemeral_disk_path);
+            disk_paths[0] = NULL;
+            ephemeral_disk_path = NULL;
+        }
+
+        if (!bios_initialise_drive_tables(&emu)) {
+            fprintf(stderr, "Failed to initialise CP/M BIOS drive tables\n");
+            emulator_unmount_disks(&emu);
+            for (size_t i = 0; i < CP_M_MAX_DISK_DRIVES; ++i) {
+                free(disk_translation_tables[i]);
+            }
+            return EXIT_FAILURE;
+        }
     }
 
     for (size_t i = 0; i < CP_M_MAX_DISK_DRIVES; ++i) {
@@ -4973,10 +5222,22 @@ int main(int argc, char **argv)
         disk_geometries[i].translation_table_length = 0U;
     }
 
-    if (!bios_initialise_drive_tables(&emu)) {
-        fprintf(stderr, "Failed to initialise CP/M BIOS drive tables\n");
-        emulator_unmount_disks(&emu);
-        return EXIT_FAILURE;
+    if (emu.model == EMULATOR_MODEL_ZX128K) {
+        if (rom_path == NULL) {
+            fprintf(stderr, "ROM image required for 128K model\n");
+            emulator_unmount_disks(&emu);
+            return EXIT_FAILURE;
+        }
+        if (!zx128_load_rom_image(&emu, rom_path)) {
+            emulator_unmount_disks(&emu);
+            return EXIT_FAILURE;
+        }
+        zx128_refresh_memory_map(&emu);
+        memory_loaded = true;
+        if (!entry_specified) {
+            entry_point = 0x0000U;
+        }
+        entry_specified = true;
     }
 
     if (program_path != NULL) {

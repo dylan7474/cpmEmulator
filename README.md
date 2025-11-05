@@ -96,6 +96,16 @@ Once the machine reaches the CCP prompt, you can run any CP/M commands available
 
 Mounting a disk image with `--disk` is optional—omit the flag entirely if you only need to confirm that the supervisor stack boots. When you do want storage attached but don't already have a CP/M disk handy, the `scripts/run_cpm_system_image_test.sh` helper shows how to fabricate a minimal one: it writes a single-track file containing 26 sectors of 128 bytes each and preloads a short message for the BIOS regression. You can reuse that geometry to build a blank image of the same size with your preferred tooling (for example, via a short Python or `dd` snippet) and pass its path to `--disk A:` to have it appear as drive A: in the CP/M session.
 
+### Booting the Spectrum 128K ROM menu
+
+The emulator can also expose a simple ZX Spectrum 128K memory map so you can exercise the 128K ROM. Select the model and provide a 16 KiB or 32 KiB ROM image at the end of the command line:
+
+```
+./z80 --model 128k 128.rom
+```
+
+In this mode the emulator wires port `0x7FFD` so the ROM sees the expected paging hardware. The lower 16 KiB of the address space is treated as ROM and is not writable. RAM writes are mirrored back into the paged banks so the ROM's detection code can flip between the different 16 KiB windows. Other CP/M-oriented options (such as disk attachment) are ignored when Spectrum emulation is active.
+
 When no disk is supplied alongside the supervisor images, the emulator now creates a temporary, blank system disk in `/tmp` that contains the preloaded CCP/BDOS and BIOS bytes. This synthetic volume lets the bundled CP/M stack reach the `A>` prompt without requiring a separate media image on disk. The file is unlinked immediately after the emulator opens it, so runs without an explicit `--disk` flag leave no artefacts behind, and subsequent warm boots continue to reload the resident system from the same in-memory media.
 
 ### Inspecting BIOS disk tables
@@ -120,6 +130,7 @@ After validating the supervisor image, the regression mounts a generated single-
 
 Useful command-line options:
 
+- `--model cpm|128k` – Select the CP/M emulation (default) or enable the ZX Spectrum 128K memory map. When `128k` is chosen, pass a 16 KiB or 32 KiB ROM image as the final positional argument instead of a CP/M transient program.
 - `--cycles N` – Limit execution to `N` T-states before halting automatically (default: 1,000,000). Pass `0` to run without a cap until the guest HALTs.
 - `--disk DRIVE:path` – Mount a raw disk image on CP/M drive letter `DRIVE` (for example, `--disk B:disks/work.img`). The legacy shorthand `--disk-a` is still accepted for convenience.
 - `--disk-geom DRIVE:spt:ssize[:tracks]` – Override the sectors per track, sector size in bytes, and optional track count before mounting a drive. Geometry defaults to 26×128-byte sectors when unspecified.
