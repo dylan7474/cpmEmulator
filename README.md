@@ -150,4 +150,24 @@ To validate the IX/IY-prefixed instruction paths against real system software, t
 
 ## Next steps
 
-Contributions that expand opcode coverage, improve testing, or add CP/M-compatible peripherals are welcome.
+The emulator now boots curated CP/M 2.2 images and supports substantial BDOS/BIOS trapping, so the highest-leverage work is tightening compatibility around the remaining edge cases. Recommended priorities:
+
+1. **Close the remaining CPU decode gaps**  
+   Finish the less common Z80 instruction paths that can still trigger `Unimplemented opcode` aborts, then add targeted flag-behaviour tests for each newly covered family (especially `ED` and prefixed corner cases) so regressions are caught quickly.
+
+2. **Add interrupt and timing validation coverage**  
+   Build focused regressions for IM 0/1/2 behaviour, `EI`/`DI` sequencing, and cycle-accounting sanity checks against known-good traces. This will reduce emulator drift as more system software is exercised.
+
+3. **Expand disk controller fidelity behind the existing BIOS trap API**  
+   Evolve the current status-code-oriented disk layer toward fuller CP/M FDC semantics (address validation, error propagation, and write-path edge cases), while keeping compatibility with `examples/bios_disk.bin` and the generated regression media.
+
+4. **Broaden CP/M device emulation with stream-separated host plumbing**  
+   Extend auxiliary device support (reader/punch/list variants and console-adjacent ports) using independent host streams so tests can continue asserting each channel deterministically.
+
+5. **Strengthen end-to-end system-image regression scenarios**  
+   Add additional supervisor-driven workflows (for example, directory operations plus random/sequential file updates in one run) that verify BDOS metadata, disk translation tables, and CPMI-derived defaults remain coherent across warm boots.
+
+6. **Improve observability for debugging and contributor onboarding**  
+   Introduce optional tracing hooks (opcode, BIOS call, and disk I/O summaries) and document recommended debug workflows so new contributors can reproduce failures from CI logs quickly.
+
+If you want to start small, begin with one missing opcode family plus a matching regression test and update this section with the next uncovered target.
