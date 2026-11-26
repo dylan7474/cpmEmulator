@@ -3052,16 +3052,21 @@ static int execute_ed_prefixed(Emulator *emu, IndexMode mode)
     case 0x60:
     case 0x68:
     case 0x78: {
-        uint8_t *reg = decode_register(&emu->cpu, (opcode >> 3) & 0x07U);
-        if (reg != NULL) {
-            uint8_t value = handle_in(emu, emu->cpu.c);
-            *reg = value;
-            set_flag(&emu->cpu, FLAG_S, (value & 0x80U) != 0U);
-            set_flag(&emu->cpu, FLAG_Z, value == 0U);
-            set_flag(&emu->cpu, FLAG_H, false);
-            set_flag(&emu->cpu, FLAG_N, false);
-            set_flag(&emu->cpu, FLAG_PV, parity_even(value));
+        uint8_t reg_index = (opcode >> 3) & 0x07U;
+        uint8_t value = handle_in(emu, emu->cpu.c);
+        if (reg_index == 6U) {
+            memory_write8(emu, z80_hl(&emu->cpu), value);
+        } else {
+            uint8_t *reg = decode_register(&emu->cpu, reg_index);
+            if (reg != NULL) {
+                *reg = value;
+            }
         }
+        set_flag(&emu->cpu, FLAG_S, (value & 0x80U) != 0U);
+        set_flag(&emu->cpu, FLAG_Z, value == 0U);
+        set_flag(&emu->cpu, FLAG_H, false);
+        set_flag(&emu->cpu, FLAG_N, false);
+        set_flag(&emu->cpu, FLAG_PV, parity_even(value));
         return 12;
     }
     case 0x41:
@@ -3071,8 +3076,14 @@ static int execute_ed_prefixed(Emulator *emu, IndexMode mode)
     case 0x61:
     case 0x69:
     case 0x79: {
-        uint8_t *reg = decode_register(&emu->cpu, (opcode >> 3) & 0x07U);
-        uint8_t value = (reg != NULL) ? *reg : 0U;
+        uint8_t reg_index = (opcode >> 3) & 0x07U;
+        uint8_t value;
+        if (reg_index == 6U) {
+            value = memory_read8(emu, z80_hl(&emu->cpu));
+        } else {
+            uint8_t *reg = decode_register(&emu->cpu, reg_index);
+            value = (reg != NULL) ? *reg : 0U;
+        }
         handle_out(emu, emu->cpu.c, value);
         return 12;
     }
@@ -3361,6 +3372,134 @@ static int execute_ed_prefixed(Emulator *emu, IndexMode mode)
         set_flag(&emu->cpu, FLAG_PV, bc != 0U);
         set_flag(&emu->cpu, FLAG_C, carry);
         if (bc != 0U && !flag_set(&emu->cpu, FLAG_Z)) {
+            emu->cpu.pc = (uint16_t)(emu->cpu.pc - 2U);
+            return 21;
+        }
+        return 16;
+    }
+    case 0xA2: { /* INI */
+        uint16_t hl = z80_get_hl_variant(&emu->cpu, mode);
+        uint16_t bc = z80_bc(&emu->cpu);
+        uint8_t value = handle_in(emu, (uint8_t)(bc & 0xFFU));
+        memory_write8(emu, hl, value);
+        hl = (uint16_t)(hl + 1U);
+        bc = (uint16_t)(bc - 0x0100U);
+        z80_set_hl_variant(&emu->cpu, mode, hl);
+        z80_set_bc(&emu->cpu, bc);
+        set_flag(&emu->cpu, FLAG_H, false);
+        set_flag(&emu->cpu, FLAG_N, true);
+        set_flag(&emu->cpu, FLAG_PV, (bc & 0xFF00U) != 0U);
+        return 16;
+    }
+    case 0xB2: { /* INIR */
+        uint16_t hl = z80_get_hl_variant(&emu->cpu, mode);
+        uint16_t bc = z80_bc(&emu->cpu);
+        uint8_t value = handle_in(emu, (uint8_t)(bc & 0xFFU));
+        memory_write8(emu, hl, value);
+        hl = (uint16_t)(hl + 1U);
+        bc = (uint16_t)(bc - 0x0100U);
+        z80_set_hl_variant(&emu->cpu, mode, hl);
+        z80_set_bc(&emu->cpu, bc);
+        set_flag(&emu->cpu, FLAG_H, false);
+        set_flag(&emu->cpu, FLAG_N, true);
+        set_flag(&emu->cpu, FLAG_PV, (bc & 0xFF00U) != 0U);
+        if ((bc & 0xFF00U) != 0U) {
+            emu->cpu.pc = (uint16_t)(emu->cpu.pc - 2U);
+            return 21;
+        }
+        return 16;
+    }
+    case 0xAA: { /* IND */
+        uint16_t hl = z80_get_hl_variant(&emu->cpu, mode);
+        uint16_t bc = z80_bc(&emu->cpu);
+        uint8_t value = handle_in(emu, (uint8_t)(bc & 0xFFU));
+        memory_write8(emu, hl, value);
+        hl = (uint16_t)(hl - 1U);
+        bc = (uint16_t)(bc - 0x0100U);
+        z80_set_hl_variant(&emu->cpu, mode, hl);
+        z80_set_bc(&emu->cpu, bc);
+        set_flag(&emu->cpu, FLAG_H, false);
+        set_flag(&emu->cpu, FLAG_N, true);
+        set_flag(&emu->cpu, FLAG_PV, (bc & 0xFF00U) != 0U);
+        return 16;
+    }
+    case 0xBA: { /* INDR */
+        uint16_t hl = z80_get_hl_variant(&emu->cpu, mode);
+        uint16_t bc = z80_bc(&emu->cpu);
+        uint8_t value = handle_in(emu, (uint8_t)(bc & 0xFFU));
+        memory_write8(emu, hl, value);
+        hl = (uint16_t)(hl - 1U);
+        bc = (uint16_t)(bc - 0x0100U);
+        z80_set_hl_variant(&emu->cpu, mode, hl);
+        z80_set_bc(&emu->cpu, bc);
+        set_flag(&emu->cpu, FLAG_H, false);
+        set_flag(&emu->cpu, FLAG_N, true);
+        set_flag(&emu->cpu, FLAG_PV, (bc & 0xFF00U) != 0U);
+        if ((bc & 0xFF00U) != 0U) {
+            emu->cpu.pc = (uint16_t)(emu->cpu.pc - 2U);
+            return 21;
+        }
+        return 16;
+    }
+    case 0xA3: { /* OUTI */
+        uint16_t hl = z80_get_hl_variant(&emu->cpu, mode);
+        uint16_t bc = z80_bc(&emu->cpu);
+        uint8_t value = memory_read8(emu, hl);
+        handle_out(emu, (uint8_t)(bc & 0xFFU), value);
+        hl = (uint16_t)(hl + 1U);
+        bc = (uint16_t)(bc - 0x0100U);
+        z80_set_hl_variant(&emu->cpu, mode, hl);
+        z80_set_bc(&emu->cpu, bc);
+        set_flag(&emu->cpu, FLAG_H, false);
+        set_flag(&emu->cpu, FLAG_N, true);
+        set_flag(&emu->cpu, FLAG_PV, (bc & 0xFF00U) != 0U);
+        return 16;
+    }
+    case 0xB3: { /* OTIR */
+        uint16_t hl = z80_get_hl_variant(&emu->cpu, mode);
+        uint16_t bc = z80_bc(&emu->cpu);
+        uint8_t value = memory_read8(emu, hl);
+        handle_out(emu, (uint8_t)(bc & 0xFFU), value);
+        hl = (uint16_t)(hl + 1U);
+        bc = (uint16_t)(bc - 0x0100U);
+        z80_set_hl_variant(&emu->cpu, mode, hl);
+        z80_set_bc(&emu->cpu, bc);
+        set_flag(&emu->cpu, FLAG_H, false);
+        set_flag(&emu->cpu, FLAG_N, true);
+        set_flag(&emu->cpu, FLAG_PV, (bc & 0xFF00U) != 0U);
+        if ((bc & 0xFF00U) != 0U) {
+            emu->cpu.pc = (uint16_t)(emu->cpu.pc - 2U);
+            return 21;
+        }
+        return 16;
+    }
+    case 0xAB: { /* OUTD */
+        uint16_t hl = z80_get_hl_variant(&emu->cpu, mode);
+        uint16_t bc = z80_bc(&emu->cpu);
+        uint8_t value = memory_read8(emu, hl);
+        handle_out(emu, (uint8_t)(bc & 0xFFU), value);
+        hl = (uint16_t)(hl - 1U);
+        bc = (uint16_t)(bc - 0x0100U);
+        z80_set_hl_variant(&emu->cpu, mode, hl);
+        z80_set_bc(&emu->cpu, bc);
+        set_flag(&emu->cpu, FLAG_H, false);
+        set_flag(&emu->cpu, FLAG_N, true);
+        set_flag(&emu->cpu, FLAG_PV, (bc & 0xFF00U) != 0U);
+        return 16;
+    }
+    case 0xBB: { /* OTDR */
+        uint16_t hl = z80_get_hl_variant(&emu->cpu, mode);
+        uint16_t bc = z80_bc(&emu->cpu);
+        uint8_t value = memory_read8(emu, hl);
+        handle_out(emu, (uint8_t)(bc & 0xFFU), value);
+        hl = (uint16_t)(hl - 1U);
+        bc = (uint16_t)(bc - 0x0100U);
+        z80_set_hl_variant(&emu->cpu, mode, hl);
+        z80_set_bc(&emu->cpu, bc);
+        set_flag(&emu->cpu, FLAG_H, false);
+        set_flag(&emu->cpu, FLAG_N, true);
+        set_flag(&emu->cpu, FLAG_PV, (bc & 0xFF00U) != 0U);
+        if ((bc & 0xFF00U) != 0U) {
             emu->cpu.pc = (uint16_t)(emu->cpu.pc - 2U);
             return 21;
         }
