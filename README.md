@@ -12,6 +12,12 @@ The current state includes:
 - BDOS trampolines covering sequential and random record file I/O alongside directory search helpers (`SEARCH FIRST`/`SEARCH NEXT`) so console utilities can enumerate the mounted disk images without custom host shims while remaining compatible with extent sequencing, and a reader-device shim so paper-tape oriented programs can ingest host data without custom BIOS patches.
 - Console device shims that drive the standard console, punch, and list streams so host tooling can observe printer or paper-tape output without custom BIOS patches, now including BDOS console-status polling against host input readiness and BIOS port handlers so `--no-cpm-traps` runs still capture punch and list output while exposing Altair-style console-status readiness to unmodified system BIOS code.
 
+### Recently completed (v0.3)
+- **Full ED-prefixed block I/O instructions** — `INI`, `INIR`, `IND`, `INDR`, `OUTI`, `OTIR`, `OUTD`, `OTDR` (8 instructions) with correct B-register repeat logic and PV flag behavior
+- **IX/IY variants of block I/O** — Works with `DD`/`FD` prefixes via existing `IndexMode` infrastructure
+- **`IN r,(C)` / `OUT (C),r` for r=6 (HL)** — Now correctly accesses memory at HL
+- **CP/M 2.2 system image boots without unimplemented opcodes** — Full supervisor stack (CCP/BDOS/BIOS from z80pack) executes 500K+ cycles cleanly
+
 Expect to extend the instruction coverage and peripheral behaviour as CP/M functionality is implemented.
 
 ## Prerequisites
@@ -150,24 +156,27 @@ To validate the IX/IY-prefixed instruction paths against real system software, t
 
 ## Next steps
 
-The emulator now boots curated CP/M 2.2 images and supports substantial BDOS/BIOS trapping, so the highest-leverage work is tightening compatibility around the remaining edge cases. Recommended priorities:
+The emulator now boots curated CP/M 2.2 images, implements the full documented ED-prefixed instruction set (including all 8 block I/O instructions: `INI`/`INIR`/`IND`/`INDR`/`OUTI`/`OTIR`/`OUTD`/`OTDR`), and supports substantial BDOS/BIOS trapping. Remaining work focuses on tightening compatibility and observability:
 
-1. **Close the remaining CPU decode gaps**  
-   Finish the less common Z80 instruction paths that can still trigger `Unimplemented opcode` aborts, then add targeted flag-behaviour tests for each newly covered family (especially `ED` and prefixed corner cases) so regressions are caught quickly.
+1. **Interrupt and timing validation coverage**  
+   Build focused regressions for IM 0/1/2 behaviour, `EI`/`DI` sequencing, and cycle-accounting sanity checks against known-good traces (e.g., `zexall`/`zexdoc`). This will reduce emulator drift as more system software is exercised.
 
-2. **Add interrupt and timing validation coverage**  
-   Build focused regressions for IM 0/1/2 behaviour, `EI`/`DI` sequencing, and cycle-accounting sanity checks against known-good traces. This will reduce emulator drift as more system software is exercised.
+2. **Expand disk controller fidelity behind the existing BIOS trap API**  
+   Evolve the current status-code-oriented disk layer toward fuller CP/M FDC semantics (address validation, error propagation, write-path edge cases, sector CRC, motor on/off, seek timing), while keeping compatibility with `examples/bios_disk.bin` and the generated regression media.
 
-3. **Expand disk controller fidelity behind the existing BIOS trap API**  
-   Evolve the current status-code-oriented disk layer toward fuller CP/M FDC semantics (address validation, error propagation, and write-path edge cases), while keeping compatibility with `examples/bios_disk.bin` and the generated regression media.
+3. **Memory banking for CP/M 3 / larger programs**  
+   Add bank-switching support (e.g., common 16 KiB banking schemes) to run CP/M 3 or programs exceeding 64 KiB.
 
 4. **Broaden CP/M device emulation with stream-separated host plumbing**  
    Extend auxiliary device support (reader/punch/list variants and console-adjacent ports) using independent host streams so tests can continue asserting each channel deterministically.
 
 5. **Strengthen end-to-end system-image regression scenarios**  
-   Add additional supervisor-driven workflows (for example, directory operations plus random/sequential file updates in one run) that verify BDOS metadata, disk translation tables, and CPMI-derived defaults remain coherent across warm boots.
+   Add additional supervisor-driven workflows (directory operations plus random/sequential file updates in one run) that verify BDOS metadata, disk translation tables, and CPMI-derived defaults remain coherent across warm boots.
 
 6. **Improve observability for debugging and contributor onboarding**  
-   Introduce optional tracing hooks (opcode, BIOS call, and disk I/O summaries) and document recommended debug workflows so new contributors can reproduce failures from CI logs quickly.
+   Introduce optional tracing hooks (`--trace` flag for opcode, BIOS call, and disk I/O summaries) and document recommended debug workflows so new contributors can reproduce failures from CI logs quickly.
 
-If you want to start small, begin with one missing opcode family plus a matching regression test and update this section with the next uncovered target.
+7. **CI/CD pipeline**  
+   Add GitHub Actions workflow to run `make test` on push/PR.
+
+If you want to start small, begin with interrupt timing validation against a Z80 test ROM, or add a `--trace` flag for opcode logging.
